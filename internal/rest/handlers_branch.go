@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"strings"
 
-	"gh-server/internal/db"
-	"gh-server/internal/rest/respond"
-	"gh-server/internal/rest/transform"
-	"gh-server/internal/service"
+	"github.com/ngaut/agent-git-service/internal/db"
+	"github.com/ngaut/agent-git-service/internal/rest/respond"
+	"github.com/ngaut/agent-git-service/internal/rest/transform"
+	"github.com/ngaut/agent-git-service/internal/service"
 )
 
 const branchProtectionPathSegment = "/protection"
@@ -42,7 +42,7 @@ func branchProtectionJSON(bp db.BranchProtection) map[string]any {
 }
 
 func branchProtectionBaseURL(bp db.BranchProtection) string {
-	return fmt.Sprintf("%s/api/v3/repos/%s/branches/%s/protection", transform.Base(), bp.Repository.FullName, bp.BranchName)
+	return fmt.Sprintf("%s/repos/%s/branches/%s/protection", transform.APIBase(), bp.Repository.FullName, bp.BranchName)
 }
 
 func branchProtectionRequiredStatusChecksJSON(bp db.BranchProtection) map[string]any {

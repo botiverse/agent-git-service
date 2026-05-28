@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,9 +15,10 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"gh-server/internal/db"
-	"gh-server/internal/embedding"
-	"gh-server/internal/gitstore"
+	"github.com/ngaut/agent-git-service/internal/db"
+	"github.com/ngaut/agent-git-service/internal/embedding"
+	"github.com/ngaut/agent-git-service/internal/gitstore"
+	"github.com/ngaut/agent-git-service/internal/wikicatalog"
 )
 
 // Repository lookup convention:
@@ -31,11 +33,14 @@ type Service struct {
 	Ctx            context.Context
 	DB             *gorm.DB
 	Git            *gitstore.Store
+	WikiCatalog    *wikicatalog.Catalog
+	WikiBlob       *wikicatalog.BlobStore
 	BaseURL        string
 	AttachmentRoot string
 	Embedder       embedding.Embedder
 	AllowAnyToken  bool
-	Auth0          Auth0DeviceFlow
+	OIDC           OIDCProvider
+	SlockOAuth     SlockOAuthProvider
 	// AttachmentScanner is an optional hook for virus scanning or policy checks
 	// before an attachment is written to disk.
 	AttachmentScanner func(ctx context.Context, filename, contentType string, content []byte) error
@@ -70,6 +75,18 @@ type Service struct {
 	workflowSyncMu     map[string]*sync.Mutex
 	workflowSyncMapMu  sync.Mutex
 
+	wikiMigrationSyncMuOnce sync.Once
+	wikiMigrationSyncMu     map[string]*sync.Mutex
+	wikiMigrationSyncMapMu  sync.Mutex
+
+	wikiBgMigrationMuOnce sync.Once
+	wikiBgMigrationMu     map[string]struct{}
+	wikiBgMigrationMapMu  sync.RWMutex
+
+	wikiBgCompactionMuOnce sync.Once
+	wikiBgCompactionMu     map[string]string
+	wikiBgCompactionMapMu  sync.RWMutex
+
 	workflowStepRunner workflowStepRunner
 
 	// tokenTouchCache deduplicates TouchToken DB writes in-memory.
@@ -87,6 +104,33 @@ type Service struct {
 
 	webhookWorkersOnce sync.Once
 	webhookJobs        chan webhookJob
+
+	// testWikiMigrationAfterSnapshot is a test-only hook used to
+	// coordinate concurrent migration callers after they have loaded the
+	// migrated-commit snapshot but before they replay any git commits.
+	testWikiMigrationAfterSnapshot func(repoFullName string)
+
+	// testWikiBackgroundMigrationStarted is a test-only hook fired when a
+	// repo-scoped background wiki migration is claimed and scheduled.
+	testWikiBackgroundMigrationStarted func(repoFullName string)
+
+	// testWikiCompactRefUpdateFailure lets tests force the compact ref update
+	// path to fail after the catalog transaction commits.
+	testWikiCompactRefUpdateFailure func(repoFullName, commitSHA string) error
+
+	// testWikiCompactionJobStarted is a test-only hook fired after the async
+	// compaction worker marks a job running.
+	testWikiCompactionJobStarted func(jobID string)
+
+	// testWikiCompactionJobContinue is a test-only hook that can block the
+	// async compaction worker until tests allow it to proceed.
+	testWikiCompactionJobContinue func(jobID string)
+}
+
+type tenantRepoKey struct {
+	db     *sql.DB
+	repoID uint
+	repo   string
 }
 
 func (s *Service) workflowSyncMuInit() {
@@ -105,6 +149,115 @@ func (s *Service) getWorkflowSyncMu(repoFullName string) *sync.Mutex {
 		s.workflowSyncMu[repoFullName] = mu
 	}
 	return mu
+}
+
+func (s *Service) wikiMigrationSyncMuInit() {
+	s.wikiMigrationSyncMu = make(map[string]*sync.Mutex)
+}
+
+func (s *Service) getWikiMigrationSyncMu(key tenantRepoKey) *sync.Mutex {
+	s.wikiMigrationSyncMuOnce.Do(s.wikiMigrationSyncMuInit)
+
+	s.wikiMigrationSyncMapMu.Lock()
+	defer s.wikiMigrationSyncMapMu.Unlock()
+
+	muKey := s.tenantRepoMutexKey(key)
+	mu, ok := s.wikiMigrationSyncMu[muKey]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.wikiMigrationSyncMu[muKey] = mu
+	}
+	return mu
+}
+
+func (s *Service) wikiBgMigrationMuInit() {
+	s.wikiBgMigrationMu = make(map[string]struct{})
+}
+
+func (s *Service) wikiBgCompactionMuInit() {
+	s.wikiBgCompactionMu = make(map[string]string)
+}
+
+func (s *Service) claimWikiBackgroundMigration(key tenantRepoKey) bool {
+	s.wikiBgMigrationMuOnce.Do(s.wikiBgMigrationMuInit)
+
+	s.wikiBgMigrationMapMu.Lock()
+	defer s.wikiBgMigrationMapMu.Unlock()
+
+	muKey := s.tenantRepoMutexKey(key)
+	if _, ok := s.wikiBgMigrationMu[muKey]; ok {
+		return false
+	}
+	s.wikiBgMigrationMu[muKey] = struct{}{}
+	return true
+}
+
+func (s *Service) releaseWikiBackgroundMigration(key tenantRepoKey) {
+	s.wikiBgMigrationMuOnce.Do(s.wikiBgMigrationMuInit)
+
+	s.wikiBgMigrationMapMu.Lock()
+	defer s.wikiBgMigrationMapMu.Unlock()
+	delete(s.wikiBgMigrationMu, s.tenantRepoMutexKey(key))
+}
+
+func (s *Service) claimWikiBackgroundCompaction(key tenantRepoKey, jobID string) bool {
+	s.wikiBgCompactionMuOnce.Do(s.wikiBgCompactionMuInit)
+
+	s.wikiBgCompactionMapMu.Lock()
+	defer s.wikiBgCompactionMapMu.Unlock()
+
+	muKey := s.tenantRepoMutexKey(key)
+	if _, ok := s.wikiBgCompactionMu[muKey]; ok {
+		return false
+	}
+	s.wikiBgCompactionMu[muKey] = jobID
+	return true
+}
+
+func (s *Service) releaseWikiBackgroundCompaction(key tenantRepoKey, jobID string) {
+	s.wikiBgCompactionMuOnce.Do(s.wikiBgCompactionMuInit)
+
+	s.wikiBgCompactionMapMu.Lock()
+	defer s.wikiBgCompactionMapMu.Unlock()
+
+	muKey := s.tenantRepoMutexKey(key)
+	if activeJobID, ok := s.wikiBgCompactionMu[muKey]; ok && activeJobID == jobID {
+		delete(s.wikiBgCompactionMu, muKey)
+	}
+}
+
+func (s *Service) isWikiBackgroundMigrationRunning(key tenantRepoKey) bool {
+	s.wikiBgMigrationMuOnce.Do(s.wikiBgMigrationMuInit)
+
+	s.wikiBgMigrationMapMu.RLock()
+	defer s.wikiBgMigrationMapMu.RUnlock()
+	_, ok := s.wikiBgMigrationMu[s.tenantRepoMutexKey(key)]
+	return ok
+}
+
+func (s *Service) wikiRepoKey(ctx context.Context, repo db.Repository) tenantRepoKey {
+	key := tenantRepoKey{
+		repoID: repo.ID,
+		repo:   repo.FullName,
+	}
+	targetDB := s.DB
+	if tenantDB, ok := DBFromContext(ctx); ok && tenantDB != nil {
+		targetDB = tenantDB
+	}
+	if targetDB != nil {
+		if sqlDB, err := s.sqlDBHandle(targetDB); err == nil {
+			key.db = sqlDB
+		}
+	}
+	return key
+}
+
+func (s *Service) tenantRepoMutexKey(key tenantRepoKey) string {
+	return fmt.Sprintf("%p:%d:%s", key.db, key.repoID, key.repo)
+}
+
+func (s *Service) sqlDBHandle(dbh interface{ DB() (*sql.DB, error) }) (*sql.DB, error) {
+	return dbh.DB()
 }
 
 // DBForCtx returns the per-request DB when one was injected via
@@ -324,7 +477,7 @@ func (s *Service) CreateRepo(ctx context.Context, in CreateRepoInput) (db.Reposi
 				if err := s.DBForCtx(ctx).Transaction(func(tx *gorm.DB) error {
 					principalIDs := []uint{viewer.ID}
 					if viewer.UserKind == db.UserKindAgent {
-						humanID, ok, err := s.boundHumanIDForAgent(ctx, viewer.ID)
+						humanID, ok, err := boundHumanIDForAgentQuery(tx, viewer.ID)
 						if err != nil {
 							return err
 						}
@@ -414,7 +567,7 @@ func (s *Service) ensureOrgRepoGovernanceTx(ctx context.Context, tx *gorm.DB, or
 
 	principalIDs := []uint{viewer.ID}
 	if viewer.UserKind == db.UserKindAgent {
-		humanID, ok, err := s.boundHumanIDForAgent(ctx, viewer.ID)
+		humanID, ok, err := boundHumanIDForAgentQuery(tx, viewer.ID)
 		if err != nil {
 			return err
 		}
@@ -753,6 +906,9 @@ func (s *Service) deleteRepoCascade(tx *gorm.DB, repoID uint, fullName string) e
 		return err
 	}
 	if err := del(tx.Where("repository_id = ?", repoID).Delete(&db.CommitStatus{})); err != nil {
+		return err
+	}
+	if err := del(tx.Where("repository_id = ?", repoID).Delete(&db.WikiCompactionJob{})); err != nil {
 		return err
 	}
 	if err := del(tx.Where("repository_id = ?", repoID).Delete(&db.WikiSearchDocument{})); err != nil {

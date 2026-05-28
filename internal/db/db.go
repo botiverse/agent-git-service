@@ -65,6 +65,9 @@ func (l *gormSlogLogger) Trace(ctx context.Context, begin time.Time, fc func() (
 	if l.cfg.LogLevel == gormlogger.Silent {
 		return
 	}
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 
 	elapsed := time.Since(begin)
 	switch {
@@ -309,7 +312,20 @@ func Migrate(database *gorm.DB) error {
 		&UserLastSeen{},
 		&IssueReadState{},
 		&WikiPageLabel{},
+		&WikiPageIndex{},
+		&WikiIndexState{},
+		&WikiBacklink{},
+		&WikiPageHistory{},
 		&WikiSearchDocument{},
+		&WikiPage{},
+		&WikiPageRevision{},
+		&WikiChangeset{},
+		&WikiRepoHead{},
+		&WikiCompactionJob{},
+		&WikiDirIndex{},
+		&WikiPageLink{},
+		&WikiBlobRef{},
+		&WikiPendingBlob{},
 	); err != nil {
 		return err
 	}
@@ -333,6 +349,9 @@ func Migrate(database *gorm.DB) error {
 		return err
 	}
 	if err := MigrateIssueSearch(database); err != nil {
+		return err
+	}
+	if err := MigrateWikiSearch(database); err != nil {
 		return err
 	}
 	// Add unique index on (project_id, content_id, type) to prevent duplicate items
@@ -389,5 +408,6 @@ func InitVector(database *gorm.DB, dims int) {
 		}
 	}
 
+	ensureWikiSearchVector(database, dims)
 	ensureVectorIndexes(database)
 }

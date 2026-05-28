@@ -10,7 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
-	"gh-server/internal/metrics"
+	"github.com/ngaut/agent-git-service/internal/metrics"
 )
 
 type operationStateKey struct{}
@@ -87,7 +87,7 @@ func deriveOperation(method, route string, state *operationState) (string, strin
 		return "git", "git_push"
 	case route == "/api/graphql" || route == "/graphql":
 		return "graphql", "graphql"
-	case strings.HasPrefix(route, "/login/") || strings.HasPrefix(route, "/api/v3/auth0/"):
+	case strings.HasPrefix(route, "/login/") || strings.HasPrefix(route, "/api/v3/oidc/"):
 		return "rest", "auth"
 	case route == "/api/v3" || route == "/api/v3/" || route == "/api/v3/meta" || route == "/api/v3/rate_limit":
 		return "rest", "api_discovery"

@@ -28,13 +28,13 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"gh-server/internal/authn"
-	"gh-server/internal/db"
-	applog "gh-server/internal/logging"
-	"gh-server/internal/ratelimit"
-	"gh-server/internal/rest/respond"
-	"gh-server/internal/rest/transform"
-	"gh-server/internal/service"
+	"github.com/ngaut/agent-git-service/internal/authn"
+	"github.com/ngaut/agent-git-service/internal/db"
+	applog "github.com/ngaut/agent-git-service/internal/logging"
+	"github.com/ngaut/agent-git-service/internal/ratelimit"
+	"github.com/ngaut/agent-git-service/internal/rest/respond"
+	"github.com/ngaut/agent-git-service/internal/rest/transform"
+	"github.com/ngaut/agent-git-service/internal/service"
 )
 
 // mustIntParam extracts a numeric URL parameter and writes a 422 response
@@ -133,12 +133,13 @@ type Deps struct {
 // GetMeta handles GET /api/v3/
 func (d *Deps) GetMeta(w http.ResponseWriter, r *http.Request) {
 	b := d.Svc.BaseURL
+	apiBase := transform.APIPrefix()
 	respond.JSON(w, 200, map[string]any{
-		"current_user_url":                   b + "/api/v3/user",
-		"repository_url":                     b + "/api/v3/repos/{owner}/{repo}",
-		"user_url":                           b + "/api/v3/users/{user}",
-		"organization_url":                   b + "/api/v3/orgs/{org}",
-		"openapi_url":                        b + "/api/v3/openapi.json",
+		"current_user_url":                   b + apiBase + "/user",
+		"repository_url":                     b + apiBase + "/repos/{owner}/{repo}",
+		"user_url":                           b + apiBase + "/users/{user}",
+		"organization_url":                   b + apiBase + "/orgs/{org}",
+		"openapi_url":                        b + apiBase + "/openapi.json",
 		"verifiable_password_authentication": true,
 	})
 }
@@ -334,15 +335,15 @@ func (d *Deps) authorAssociationChecks(ctx context.Context, repo db.Repository) 
 	)
 	collabCheck := func(userID uint) bool {
 		if !collabLoaded {
-			collabs, err := d.Svc.ListCollaborators(ctx, repo.ID)
+			userIDs, err := d.Svc.ListCollaboratorUserIDs(ctx, repo.ID)
 			if err != nil {
 				logErr(ctx, "authorAssociation: list collaborators", err)
 				collabLoaded = true
 				return false
 			}
-			collabIDs = make(map[uint]struct{}, len(collabs))
-			for _, c := range collabs {
-				collabIDs[c.UserID] = struct{}{}
+			collabIDs = make(map[uint]struct{}, len(userIDs))
+			for _, id := range userIDs {
+				collabIDs[id] = struct{}{}
 			}
 			collabLoaded = true
 		}
@@ -398,10 +399,16 @@ func (d *Deps) mustGetOrg(w http.ResponseWriter, r *http.Request) *db.User {
 }
 
 // logErr logs a non-nil error from a service call that would otherwise be swallowed.
-func logErr(ctx context.Context, op string, err error) {
-	if err != nil {
-		slog.ErrorContext(ctx, op, "error", err)
+func logErr(ctx context.Context, op string, err error, attrs ...any) {
+	if err == nil || isContextCanceled(err) {
+		return
 	}
+	attrs = append(attrs, "error", err)
+	slog.ErrorContext(ctx, op, attrs...)
+}
+
+func isContextCanceled(err error) bool {
+	return errors.Is(err, context.Canceled)
 }
 
 // decodeBody decodes JSON from the request body into dst.

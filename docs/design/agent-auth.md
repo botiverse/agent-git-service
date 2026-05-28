@@ -75,7 +75,7 @@ Notes:
 
 ### Human login
 
-Human users continue to authenticate via Auth0. Token issuance remains standard.
+Human users authenticate through the configured OIDC provider. Token issuance remains standard.
 
 ### Agent binding
 
@@ -106,10 +106,26 @@ Humans can reset tokens for bound agents.
 - `POST /api/v3/agent-bindings/{agent_login}/reset-token`
 - Behavior: revoke all existing tokens for that agent, issue a new one
 
+### Agent switch sessions
+
+Humans can start and refresh short-lived switch sessions for bound agents
+without rotating the agent's long-lived token.
+
+- `POST /api/v3/agent-bindings/{agent_login}/switch-session`
+- `POST /api/v3/agent-bindings/{agent_login}/refresh-session`
+- Behavior:
+  - `switch-session` issues a temporary token for the bound agent and keeps the
+    existing long-lived agent token valid.
+  - `refresh-session` accepts the current temporary token and rotates only that
+    switch-session token.
+  - `refresh-session` must accept the same supported `Authorization` formats as
+    the shared auth middleware: `token`, `Bearer`, and HTTP Basic credentials
+    with the password field carrying the token.
+
 ### Removed endpoints
 
 - `/api/v3/anonymous/*` (session/claim/merge)
-- Claim-specific Auth0 device flow endpoints if only used by anonymous flow
+- Claim-specific device-flow endpoints if only used by anonymous flow
 
 ## Org Creation and Admin Rule
 
@@ -143,6 +159,10 @@ Current backfill behavior:
    - `created_at`
 3. Token lifecycle:
    - agent reset revokes existing tokens for the target agent and issues a new one
+   - switch-session creates a short-lived temporary token without revoking the
+     agent's long-lived token
+   - refresh-session revokes the prior temporary token and replaces it with a
+     fresh temporary token
    - token LRU and touch behavior remain documented in [testing/token-lifecycle.md](../testing/token-lifecycle.md)
 
 ## Security Considerations

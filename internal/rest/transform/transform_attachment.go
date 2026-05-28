@@ -5,12 +5,12 @@ import (
 	"strings"
 	"time"
 
-	"gh-server/internal/db"
+	"github.com/ngaut/agent-git-service/internal/db"
 )
 
 // Attachment converts a db.Attachment to a JSON response object.
 func Attachment(a db.Attachment) map[string]any {
-	downloadURL := fmt.Sprintf("%s/api/v3/attachments/%s", base(), a.UUID)
+	downloadURL := fmt.Sprintf("%s/attachments/%s", apiBase(), a.UUID)
 	out := map[string]any{
 		"id":            a.ID,
 		"uuid":          a.UUID,

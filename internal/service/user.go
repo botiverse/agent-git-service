@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"gh-server/internal/db"
+	"github.com/ngaut/agent-git-service/internal/db"
 
 	"gorm.io/gorm"
 )
@@ -109,7 +109,7 @@ func (s *Service) bootstrapCreatedOrgTx(ctx context.Context, tx *gorm.DB, orgID 
 		return nil
 	}
 
-	humanID, ok, err := s.boundHumanIDForAgent(ctx, viewer.ID)
+	humanID, ok, err := boundHumanIDForAgentQuery(tx, viewer.ID)
 	if err != nil || !ok || humanID == 0 || humanID == viewer.ID {
 		return err
 	}

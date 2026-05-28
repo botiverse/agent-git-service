@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"gh-server/internal/db"
-	"gh-server/internal/embedding"
-	applog "gh-server/internal/logging"
+	"github.com/ngaut/agent-git-service/internal/db"
+	"github.com/ngaut/agent-git-service/internal/embedding"
+	applog "github.com/ngaut/agent-git-service/internal/logging"
 
 	"gorm.io/gorm"
 )
@@ -39,12 +39,6 @@ func (s *Service) embedAndStore(ctx context.Context, table string, id uint, text
 	if !ok {
 		slog.ErrorContext(ctx, "embedding table not in allowlist", "table", table, "id", id)
 		return
-	}
-
-	// Truncate text to safely fit within OpenAI's 8191 token limit (~32,000 chars)
-	// Semantic meaning of the first 32KB is vastly preferable to a 400 Bad Request error.
-	if len(text) > 32000 {
-		text = text[:32000]
 	}
 
 	s.Wg.Add(1)
@@ -122,6 +116,7 @@ func (s *Service) embedAndStore(ctx context.Context, table string, id uint, text
 func (s *Service) embedWithRetry(ctx context.Context, text string) ([]float32, error) {
 	const maxRetries = 3
 	var lastErr error
+	text = embedding.TruncateInput(text)
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		vec, err := s.Embedder.Embed(ctx, text)

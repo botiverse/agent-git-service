@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"gh-server/internal/db"
-	"gh-server/internal/rest/respond"
-	"gh-server/internal/rest/transform"
-	"gh-server/internal/service"
+	"github.com/ngaut/agent-git-service/internal/db"
+	"github.com/ngaut/agent-git-service/internal/rest/respond"
+	"github.com/ngaut/agent-git-service/internal/rest/transform"
+	"github.com/ngaut/agent-git-service/internal/service"
 )
 
 // --- Issues: Listing & Filtering ---
@@ -59,6 +59,41 @@ func (d *Deps) ListIssues(w http.ResponseWriter, r *http.Request) {
 		respond.ValidationFailed(w, err.Error())
 		return
 	}
+	page, perPage := parsePagination(r)
+	if params.requiresLegacyIssueList() {
+		d.listIssuesLegacy(w, r, params, page, perPage)
+		return
+	}
+	result, err := d.Svc.ListIssuesForRESTPage(r.Context(), service.IssueListPageFilter{
+		RepoFullName:  params.repoFullName,
+		State:         params.state,
+		Labels:        params.labels,
+		Sort:          params.sort,
+		Direction:     params.direction,
+		Milestone:     params.milestone,
+		Since:         params.since,
+		Page:          page,
+		PerPage:       perPage,
+		OmitIssueBody: true,
+	})
+	if err != nil {
+		respond.ServiceErrorRequest(r, w, err)
+		return
+	}
+	setLinkHeader(w, r, d.Svc.BaseURL, int(result.Total), page, perPage)
+	items := issueListItemsFromPage(result.Items)
+	resolver := d.batchUserResolver(r.Context(), collectIssueListUserLogins(items))
+	assoc := d.issueListAuthorAssociationChecks(r.Context(), items)
+
+	out, err := d.buildIssueListResponse(r.Context(), items, resolver, assoc)
+	if err != nil {
+		respond.ServiceErrorRequest(r, w, err)
+		return
+	}
+	respond.JSON(w, 200, out)
+}
+
+func (d *Deps) listIssuesLegacy(w http.ResponseWriter, r *http.Request, params *issueListParams, page, perPage int) {
 	issues, prs, err := d.fetchIssuesAndPRs(r.Context(), params)
 	if err != nil {
 		respond.ServiceErrorRequest(r, w, err)
@@ -78,15 +113,9 @@ func (d *Deps) ListIssues(w http.ResponseWriter, r *http.Request) {
 		sortDir = "desc"
 	}
 	sortIssueItems(items, sortKey, sortDir)
-	page, perPage := parsePagination(r)
 	paged := paginate(w, r, d.Svc.BaseURL, items, page, perPage)
 	resolver := d.batchUserResolver(r.Context(), collectIssueListUserLogins(paged))
-	var assoc transform.AuthorAssociationChecks
-	if len(issues) > 0 {
-		assoc = d.authorAssociationChecks(r.Context(), issues[0].Repository)
-	} else if len(prs) > 0 {
-		assoc = d.authorAssociationChecks(r.Context(), prs[0].Repository)
-	}
+	assoc := d.issueListAuthorAssociationChecks(r.Context(), paged)
 
 	out, err := d.buildIssueListResponse(r.Context(), paged, resolver, assoc)
 	if err != nil {
@@ -94,6 +123,123 @@ func (d *Deps) ListIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respond.JSON(w, 200, out)
+}
+
+func (params *issueListParams) requiresLegacyIssueList() bool {
+	return params.assignee != "" || params.creator != "" || params.mentioned != ""
+}
+
+func issueListItemsFromPage(entries []service.IssueListPageItem) []issueListItem {
+	items := make([]issueListItem, 0, len(entries))
+	for i := range entries {
+		entry := entries[i]
+		if entry.Issue != nil {
+			items = append(items, issueListItem{
+				issue:     entry.Issue,
+				comments:  entry.Comments,
+				createdAt: entry.Issue.CreatedAt,
+				updatedAt: entry.Issue.UpdatedAt,
+				number:    entry.Issue.Number,
+			})
+			continue
+		}
+		if entry.PullRequest != nil {
+			items = append(items, issueListItem{
+				pr:        entry.PullRequest,
+				comments:  entry.Comments,
+				createdAt: entry.PullRequest.CreatedAt,
+				updatedAt: entry.PullRequest.UpdatedAt,
+				number:    entry.PullRequest.Number,
+			})
+		}
+	}
+	return items
+}
+
+func (d *Deps) issueListAuthorAssociationChecks(ctx context.Context, items []issueListItem) transform.AuthorAssociationChecks {
+	repo, ok := issueListRepository(items)
+	if !ok || d == nil || d.Svc == nil {
+		return transform.AuthorAssociationChecks{}
+	}
+	authorIDs := collectIssueListAuthorIDs(items)
+	collabIDs := make(map[uint]struct{})
+	if ids, err := d.Svc.ListCollaboratorUserIDs(ctx, repo.ID); err != nil {
+		logErr(ctx, "issueListAuthorAssociation: list collaborators", err)
+	} else {
+		for _, id := range ids {
+			collabIDs[id] = struct{}{}
+		}
+	}
+	memberIDs := make(map[uint]struct{})
+	if repo.Owner.Type == db.TypeOrganization {
+		memberCheckIDs := issueListAuthorIDsNeedingOrgMemberCheck(authorIDs, collabIDs, repo.OwnerID)
+		var err error
+		memberIDs, err = d.Svc.ListOrgMemberUserIDs(ctx, repo.OwnerID, memberCheckIDs)
+		if err != nil {
+			logErr(ctx, "issueListAuthorAssociation: list org members", err)
+			memberIDs = make(map[uint]struct{})
+		}
+	}
+	return transform.AuthorAssociationChecks{
+		IsCollaborator: func(userID uint) bool {
+			_, ok := collabIDs[userID]
+			return ok
+		},
+		IsOrgMember: func(userID uint) bool {
+			_, ok := memberIDs[userID]
+			return ok
+		},
+	}
+}
+
+func issueListRepository(items []issueListItem) (db.Repository, bool) {
+	for _, item := range items {
+		if item.issue != nil {
+			return item.issue.Repository, true
+		}
+		if item.pr != nil {
+			return item.pr.Repository, true
+		}
+	}
+	return db.Repository{}, false
+}
+
+func collectIssueListAuthorIDs(items []issueListItem) []uint {
+	ids := make([]uint, 0, len(items))
+	seen := make(map[uint]struct{})
+	add := func(id uint) {
+		if id == 0 {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	for _, item := range items {
+		if item.issue != nil {
+			add(item.issue.AuthorID)
+		}
+		if item.pr != nil {
+			add(item.pr.AuthorID)
+		}
+	}
+	return ids
+}
+
+func issueListAuthorIDsNeedingOrgMemberCheck(authorIDs []uint, collabIDs map[uint]struct{}, ownerID uint) []uint {
+	ids := make([]uint, 0, len(authorIDs))
+	for _, id := range authorIDs {
+		if id == 0 || id == ownerID {
+			continue
+		}
+		if _, ok := collabIDs[id]; ok {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func parseIssueListParams(r *http.Request) (*issueListParams, error) {

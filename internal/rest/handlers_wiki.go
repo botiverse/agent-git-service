@@ -2,19 +2,59 @@
 package rest
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
-	"gh-server/internal/rest/respond"
-	"gh-server/internal/rest/transform"
-	"gh-server/internal/service"
+	"github.com/ngaut/agent-git-service/internal/db"
+	"github.com/ngaut/agent-git-service/internal/rest/respond"
+	"github.com/ngaut/agent-git-service/internal/rest/transform"
+	"github.com/ngaut/agent-git-service/internal/service"
 )
 
 func wikiSlugParam(r *http.Request) string {
 	return pathParam(r, "slug")
+}
+
+func wikiCompactionJobIDParam(r *http.Request) string {
+	return pathParam(r, "jobID")
+}
+
+type wikiV2StateResponse struct {
+	RepositoryID         uint       `json:"repository_id"`
+	IndexedCommitSHA     string     `json:"indexed_commit_sha"`
+	IndexedAt            *time.Time `json:"indexed_at,omitempty"`
+	ReconcileRequestedAt *time.Time `json:"reconcile_requested_at,omitempty"`
+	ReconcilerLeaseUntil *time.Time `json:"reconciler_lease_until,omitempty"`
+	PageCount            int        `json:"page_count"`
+}
+
+// ListWikiTree handles GET /api/v3/repos/{owner}/{repo}/wiki/tree
+func (d *Deps) ListWikiTree(w http.ResponseWriter, r *http.Request) {
+	full := repoFullName(r)
+	if d.mustGetRepo(w, r) == nil {
+		return
+	}
+	tree, err := d.Svc.ListWikiTreeAtRef(
+		r.Context(),
+		full,
+		strings.TrimSpace(r.URL.Query().Get("path")),
+		strings.TrimSpace(r.URL.Query().Get("ref")),
+	)
+	if err != nil {
+		d.respondWikiReadError(w, r, full, err)
+		return
+	}
+	d.setWikiMigrationInProgressHeaderForRequest(w, r, full)
+	out := make([]any, 0, len(tree))
+	for _, entry := range tree {
+		out = append(out, transform.WikiTreeEntry(full, entry))
+	}
+	respond.JSON(w, http.StatusOK, out)
 }
 
 func wikiLabelFiltersFromQuery(q url.Values) (labels, excludeLabels []string) {
@@ -36,6 +76,21 @@ func splitCommaQueryValues(values []string) []string {
 		}
 	}
 	return out
+}
+
+func (d *Deps) setWikiMigrationInProgressHeaderForRequest(w http.ResponseWriter, r *http.Request, full string) {
+	ctx := context.Background()
+	if r != nil {
+		ctx = r.Context()
+	}
+	if d.Svc.IsWikiBackgroundMigrationRunning(ctx, full) {
+		w.Header().Set("X-Wiki-Migration-In-Progress", "true")
+	}
+}
+
+func (d *Deps) respondWikiReadError(w http.ResponseWriter, r *http.Request, full string, err error) {
+	d.setWikiMigrationInProgressHeaderForRequest(w, r, full)
+	respond.ServiceErrorRequest(r, w, err)
 }
 
 // SearchWikiPages handles GET /api/v3/repos/{owner}/{repo}/wiki/search
@@ -69,9 +124,10 @@ func (d *Deps) SearchWikiPages(w http.ResponseWriter, r *http.Request) {
 		ExcludeLabels: excludeLabels,
 	})
 	if err != nil {
-		respond.ServiceErrorRequest(r, w, err)
+		d.respondWikiReadError(w, r, full, err)
 		return
 	}
+	d.setWikiMigrationInProgressHeaderForRequest(w, r, full)
 	respond.JSON(w, http.StatusOK, transform.WikiSearchResponse(full, resp))
 }
 
@@ -81,6 +137,7 @@ func (d *Deps) ListWikiPages(w http.ResponseWriter, r *http.Request) {
 	if d.mustGetRepo(w, r) == nil {
 		return
 	}
+	page, perPage := parsePagination(r)
 	recursive := true
 	if raw := r.URL.Query().Get("recursive"); raw != "" {
 		parsed, err := strconv.ParseBool(raw)
@@ -98,14 +155,82 @@ func (d *Deps) ListWikiPages(w http.ResponseWriter, r *http.Request) {
 		ExcludeLabels: excludeLabels,
 	})
 	if err != nil {
-		respond.ServiceErrorRequest(r, w, err)
+		d.respondWikiReadError(w, r, full, err)
 		return
 	}
+	d.setWikiMigrationInProgressHeaderForRequest(w, r, full)
+	pages = paginate(w, r, d.Svc.BaseURL, pages, page, perPage)
 	out := make([]any, 0, len(pages))
 	for _, p := range pages {
 		out = append(out, transform.WikiPageSummary(full, p))
 	}
 	respond.JSON(w, 200, out)
+}
+
+// GetWikiState handles GET /api/v3/repos/{owner}/{repo}/wiki/state
+func (d *Deps) GetWikiState(w http.ResponseWriter, r *http.Request) {
+	full := repoFullName(r)
+	if d.mustGetRepo(w, r) == nil {
+		return
+	}
+	state, err := d.Svc.GetWikiV2State(r.Context(), full)
+	if err != nil {
+		respond.ServiceErrorRequest(r, w, err)
+		return
+	}
+	respond.JSON(w, http.StatusOK, wikiV2StateResponse{
+		RepositoryID:         state.RepositoryID,
+		IndexedCommitSHA:     state.IndexedCommitSHA,
+		IndexedAt:            state.IndexedAt,
+		ReconcileRequestedAt: state.ReconcileRequestedAt,
+		ReconcilerLeaseUntil: state.ReconcilerLeaseUntil,
+		PageCount:            state.PageCount,
+	})
+}
+
+// RequestWikiReconcile handles POST /api/v3/repos/{owner}/{repo}/wiki/reconcile/request
+func (d *Deps) RequestWikiReconcile(w http.ResponseWriter, r *http.Request) {
+	full := repoFullName(r)
+	repo := d.mustGetRepo(w, r)
+	if repo == nil {
+		return
+	}
+	if !d.requireRepoPermission(w, r, repo.ID, service.RepoPermissionWrite) {
+		return
+	}
+	result, err := d.Svc.KickWikiV2Reconcile(r.Context(), full)
+	if err != nil {
+		respond.ServiceErrorRequest(r, w, err)
+		return
+	}
+	respond.JSON(w, http.StatusAccepted, map[string]any{
+		"repository_id":      result.RepositoryID,
+		"indexed_commit_sha": result.IndexedCommitSHA,
+		"requested_at":       result.RequestedAt,
+	})
+}
+
+// ReconcileWiki handles POST /api/v3/repos/{owner}/{repo}/wiki/reconcile
+func (d *Deps) ReconcileWiki(w http.ResponseWriter, r *http.Request) {
+	full := repoFullName(r)
+	repo := d.mustGetRepo(w, r)
+	if repo == nil {
+		return
+	}
+	if !d.requireRepoPermission(w, r, repo.ID, service.RepoPermissionWrite) {
+		return
+	}
+	result, err := d.Svc.ReconcileWikiV2(r.Context(), full)
+	if err != nil {
+		respond.ServiceErrorRequest(r, w, err)
+		return
+	}
+	respond.JSON(w, http.StatusOK, map[string]any{
+		"repository_id":      result.RepositoryID,
+		"indexed_commit_sha": result.IndexedCommitSHA,
+		"page_count":         result.PageCount,
+		"reconciled":         result.Reconciled,
+	})
 }
 
 // ListWikiPageLabels handles GET /api/v3/repos/{owner}/{repo}/wiki/pages/{slug}/labels
@@ -386,9 +511,10 @@ func (d *Deps) GetWikiPage(w http.ResponseWriter, r *http.Request) {
 	}
 	page, err := d.Svc.GetWikiPageAtRef(r.Context(), full, slug, ref)
 	if err != nil {
-		respond.ServiceErrorRequest(r, w, err)
+		d.respondWikiReadError(w, r, full, err)
 		return
 	}
+	d.setWikiMigrationInProgressHeaderForRequest(w, r, full)
 	respond.JSON(w, 200, transform.WikiPage(full, page))
 }
 
@@ -406,15 +532,137 @@ func (d *Deps) listWikiPageHistory(w http.ResponseWriter, r *http.Request, full,
 	page, perPage := parsePagination(r)
 	history, total, err := d.Svc.ListWikiPageHistoryPage(r.Context(), full, slug, page, perPage)
 	if err != nil {
-		respond.ServiceErrorRequest(r, w, err)
+		d.respondWikiReadError(w, r, full, err)
 		return
 	}
+	d.setWikiMigrationInProgressHeaderForRequest(w, r, full)
 	setLinkHeader(w, r, d.Svc.BaseURL, total, page, perPage)
 	out := make([]any, 0, len(history))
 	for _, entry := range history {
 		out = append(out, transform.WikiPageHistoryEntry(entry))
 	}
 	respond.JSON(w, 200, out)
+}
+
+// CompactWikiHistory handles POST /api/v3/repos/{owner}/{repo}/wiki/compact
+func (d *Deps) CompactWikiHistory(w http.ResponseWriter, r *http.Request) {
+	full := repoFullName(r)
+	repo := d.mustGetRepo(w, r)
+	if repo == nil {
+		return
+	}
+	if !d.requireRepoPermission(w, r, repo.ID, service.RepoPermissionAdmin) {
+		return
+	}
+	if strings.TrimSpace(r.URL.Query().Get("ref")) != "" {
+		respond.Error(w, http.StatusBadRequest, "ref query parameter is not supported for wiki writes")
+		return
+	}
+	var body struct {
+		Before string `json:"before"`
+	}
+	if err := decodeBodyStrictOptional(r, &body); err != nil {
+		respond.ValidationFailed(w, "invalid body")
+		return
+	}
+	if strings.TrimSpace(body.Before) != "" {
+		respond.ValidationFailed(w, "before is not supported for wiki compact")
+		return
+	}
+	job, err := d.Svc.StartWikiCompaction(r.Context(), full)
+	if err != nil {
+		respond.ServiceErrorRequest(r, w, err)
+		return
+	}
+	statusURL := "/api/v3/repos/" + full + "/wiki/compact/" + job.ID
+	w.Header().Set("Location", statusURL)
+	respond.JSON(w, http.StatusAccepted, wikiCompactionJobResponse(job, statusURL))
+}
+
+// GetWikiCompactionJob handles GET /api/v3/repos/{owner}/{repo}/wiki/compact/{jobID}
+func (d *Deps) GetWikiCompactionJob(w http.ResponseWriter, r *http.Request) {
+	full := repoFullName(r)
+	repo := d.mustGetRepo(w, r)
+	if repo == nil {
+		return
+	}
+	if !d.requireRepoPermission(w, r, repo.ID, service.RepoPermissionAdmin) {
+		return
+	}
+	job, err := d.Svc.GetWikiCompactionJob(r.Context(), full, wikiCompactionJobIDParam(r))
+	if err != nil {
+		respond.ServiceErrorRequest(r, w, err)
+		return
+	}
+	respond.JSON(w, http.StatusOK, wikiCompactionJobResponse(job, "/api/v3/repos/"+full+"/wiki/compact/"+job.ID))
+}
+
+// RepairWikiLocks handles POST /api/v3/admin/wiki/repos/{owner}/{repo}/repair-locks
+func (d *Deps) RepairWikiLocks(w http.ResponseWriter, r *http.Request) {
+	full := repoFullName(r)
+	repo := d.mustGetRepo(w, r)
+	if repo == nil {
+		return
+	}
+	if !d.requireRepoPermission(w, r, repo.ID, service.RepoPermissionAdmin) {
+		return
+	}
+	var body struct {
+		Force bool `json:"force"`
+	}
+	if err := decodeBodyStrictOptional(r, &body); err != nil {
+		respond.ValidationFailed(w, "invalid body")
+		return
+	}
+	result, err := d.Svc.RepairWikiRefLocks(r.Context(), full, body.Force)
+	if err != nil {
+		respond.ServiceErrorRequest(r, w, err)
+		return
+	}
+	respond.JSON(w, http.StatusOK, map[string]any{
+		"ref":         result.Ref,
+		"lock_path":   result.LockPath,
+		"present":     result.Present,
+		"cleared":     result.Cleared,
+		"force":       result.Force,
+		"age_seconds": result.AgeSeconds,
+	})
+}
+
+func wikiCompactionJobResponse(job db.WikiCompactionJob, statusURL string) map[string]any {
+	resp := map[string]any{
+		"job_id":      job.ID,
+		"status":      job.Status,
+		"status_url":  statusURL,
+		"location":    statusURL,
+		"started_at":  nil,
+		"finished_at": nil,
+	}
+	if startedAt := job.StartedAt; startedAt != nil {
+		resp["started_at"] = startedAt.Format(time.RFC3339)
+	}
+	if finishedAt := job.FinishedAt; finishedAt != nil {
+		resp["finished_at"] = finishedAt.Format(time.RFC3339)
+	}
+	if previousHead := job.PreviousHead; previousHead != "" {
+		resp["previous_head"] = previousHead
+	}
+	if newHead := job.NewHead; newHead != "" {
+		resp["new_head"] = newHead
+	}
+	if compactedBefore := job.CompactedBefore; compactedBefore != nil {
+		resp["compacted_before"] = compactedBefore.Format(time.RFC3339)
+	}
+	if job.Pages > 0 || job.Status == service.WikiCompactionJobSucceeded {
+		resp["pages"] = job.Pages
+	}
+	if job.CommitsRemoved > 0 || job.Status == service.WikiCompactionJobSucceeded {
+		resp["commits_removed"] = job.CommitsRemoved
+	}
+	if errorMessage := job.ErrorMessage; errorMessage != "" {
+		resp["error"] = errorMessage
+	}
+	return resp
 }
 
 // ListWikiBacklinks handles GET /api/v3/repos/{owner}/{repo}/wiki/pages/{slug}/backlinks
@@ -426,9 +674,10 @@ func (d *Deps) ListWikiBacklinks(w http.ResponseWriter, r *http.Request) {
 	}
 	backlinks, err := d.Svc.ListWikiBacklinks(r.Context(), full, slug)
 	if err != nil {
-		respond.ServiceErrorRequest(r, w, err)
+		d.respondWikiReadError(w, r, full, err)
 		return
 	}
+	d.setWikiMigrationInProgressHeaderForRequest(w, r, full)
 	out := make([]any, 0, len(backlinks))
 	for _, backlink := range backlinks {
 		out = append(out, transform.WikiBacklink(full, backlink))

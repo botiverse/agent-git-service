@@ -8,8 +8,12 @@ import (
 	"log/slog"
 	"net/http"
 
-	"gh-server/internal/apperrors"
+	"github.com/ngaut/agent-git-service/internal/apperrors"
 )
+
+// StatusClientClosedRequest is the de-facto HTTP status used by proxies when
+// the client disconnects before the server can finish the request.
+const StatusClientClosedRequest = 499
 
 // JSON writes v as JSON with the given HTTP status.
 func JSON(w http.ResponseWriter, status int, v any) {
@@ -84,6 +88,8 @@ func ServiceErrorContext(ctx context.Context, w http.ResponseWriter, err error) 
 
 func classifyServiceError(err error) (status int, publicMessage string, errorKind string) {
 	switch {
+	case errors.Is(err, context.Canceled):
+		return StatusClientClosedRequest, "Client Closed Request", "client_closed"
 	case errors.Is(err, apperrors.ErrNotFound):
 		return http.StatusNotFound, "Not Found", "not_found"
 	case errors.Is(err, apperrors.ErrUnauthorized):
@@ -118,6 +124,8 @@ func logServiceError(ctx context.Context, status int, errorKind string, publicMe
 	}
 
 	switch {
+	case errorKind == "client_closed":
+		slog.InfoContext(ctx, "service request canceled", args...)
 	case status >= http.StatusInternalServerError:
 		slog.ErrorContext(ctx, "service request failed", args...)
 	case status >= http.StatusBadRequest:

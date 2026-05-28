@@ -13,12 +13,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
-	applog "gh-server/internal/logging"
+	applog "github.com/ngaut/agent-git-service/internal/logging"
 )
 
 const (
 	maxCapturedErrorBodyBytes  = 4 << 10
 	maxLoggedErrorMessageRunes = 512
+	statusClientClosedRequest  = 499
 )
 
 // RequestLogging attaches request-scoped structured fields and emits a single
@@ -69,6 +70,8 @@ func RequestLogging() func(http.Handler) http.Handler {
 			switch {
 			case status >= 500:
 				slog.ErrorContext(ctx, "http request completed", args...)
+			case status == statusClientClosedRequest:
+				slog.InfoContext(ctx, "http request completed", args...)
 			case status >= 400:
 				slog.WarnContext(ctx, "http request completed", args...)
 			default:

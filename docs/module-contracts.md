@@ -46,11 +46,17 @@ The main runtime layers are:
 - `db`
 - `gitstore`
 
-Supporting packages such as `config`, `oauth`, `auth0`, `authn`, `githttp`,
-`rest/respond`, `rest/transform`, `tenant`, `ratelimit`, `metrics`,
-`logging`, `httputil`, `testharness`,
+Supporting packages such as `config`, `oauth`, `authn`, `githttp`, `oidc`,
+`slockoauth`, `rest/respond`, `rest/transform`, `tenant`, `ratelimit`,
+`metrics`, `logging`, `httputil`, `testharness`,
 `apperrors`, `crypto`, `embedding`, and `randutil` are included where they
 materially affect the contracts.
+
+The public import surface is intentionally small:
+
+- `config` exposes environment-backed startup configuration.
+- `server` exposes the embeddable composition-root APIs (`New`, `Run`, `RunWikiReindex`, `Start`, `Shutdown`, and mountable handlers).
+- Everything else in the root module remains internal-only unless documented otherwise.
 
 ## Top-Level Internal Package Inventory
 
@@ -61,9 +67,7 @@ document the relevant contract below in the same change.
 | Package | Primary responsibility |
 |---|---|
 | `apperrors` | shared sentinel error catalog and helpers |
-| `auth0` | outbound Auth0 device-flow and JWKS client |
 | `authn` | low-layer token-resolver interface and auth sentinel errors |
-| `config` | environment-backed startup configuration |
 | `controlplane` | control-plane schema plus token-to-tenant DB routing |
 | `crypto` | NaCl-based secret encryption helpers |
 | `db` | relational schema, migrations, seed data, and model types |
@@ -76,14 +80,18 @@ document the relevant contract below in the same change.
 | `metrics` | Prometheus collectors and metric-recording helpers |
 | `mentions` | GitHub-style mention token parsing helpers |
 | `middleware` | auth, logging, rate-limit, and request guards |
+| `oidc` | generic OIDC discovery, device flow, and JWKS-backed ID token verification |
 | `oauth` | OAuth device-flow HTTP endpoints |
 | `randutil` | shared random helper functions |
 | `ratelimit` | GitHub-compatible rate-limit snapshot helpers |
 | `rest` | GitHub REST API surface |
 | `router` | route registration and host rewrite |
 | `service` | business logic and cross-store orchestration |
+| `slockoauth` | Login-with-Slock OAuth-style code exchange and userinfo client |
 | `tenant` | gitstore tenant context helpers for physical repo scoping |
 | `testharness` | production-wired service and router test fixtures |
+| `wikicatalog` | legacy wiki catalog primitives, slug canonicalization, and transitional blob/CAS helpers |
+| `wikiv2` | git-authoritative wiki write planning, derived index contracts, and reconcile primitives |
 
 ## Dependency Rules
 
@@ -94,7 +102,7 @@ document the relevant contract below in the same change.
 | `rest` | HTTP request decode, REST response codes, REST JSON shapes | `service`, `controlplane`, `rest/respond`, `rest/transform`, `ratelimit`, `db` model types, `Svc.Git` via `*service.Service` | GORM queries, GraphQL helpers |
 | `graphql` | GraphQL request parse, resolver dispatch, GraphQL response shapes, field filtering | `service`, `db` model types, `rest/respond` for HTTP JSON writeout, selected `Svc.Git` and `Svc.DB` access via `*service.Service` | `rest/transform` |
 | `controlplane` | control-plane schema, token-to-tenant DB routing, tenant-user bootstrap | `db`, `crypto`, GORM, standard library | `router`, `rest`, `graphql`, `gitstore`, transport rendering |
-| `service` | business rules, persistence orchestration, Git orchestration, domain side effects | `db`, `gitstore`, `embedding`, `auth0` | `router`, `middleware`, `rest`, `graphql`, HTTP response helpers |
+| `service` | business rules, persistence orchestration, Git orchestration, domain side effects | `db`, `gitstore`, `embedding`, `oidc`, `slockoauth` | `router`, `middleware`, `rest`, `graphql`, HTTP response helpers |
 | `db` | schema, migrations, seed data, relational model types, shared state constants | GORM and standard library only | `service`, `rest`, `graphql`, `gitstore` |
 | `gitstore` | Git-native repo lifecycle, refs, merge/rebase/diff/content/archive operations | system `git`, go-git, filesystem, `tenant` | `db`, `rest`, `graphql` |
 
@@ -401,7 +409,7 @@ Rules:
 Current state:
 
 - `main` is the primary consumer
-- the package now owns control-plane, Auth0, logging, and multi-listener configuration flags
+- the package now owns control-plane, OIDC, logging, and multi-listener configuration flags
 
 ### `controlplane`
 
@@ -429,23 +437,24 @@ Assessment:
 - runtime-critical in multi-tenant mode
 - belongs in the explicit contract surface rather than being treated as incidental glue
 
-### `auth0`
+### `oidc`
 
 Ownership:
 
-- Auth0 device-code requests
-- Auth0 token exchange
-- ID token verification through JWKS
+- generic OIDC discovery document loading
+- generic device-authorization and token exchange helpers
+- JWKS-backed ID token verification and claim decoding for provider-neutral login
 
 Rules:
 
 - may perform outbound HTTP and JWT validation
-- must not persist application users or tokens directly; `service` owns that mapping
+- must stay transport-agnostic and must not persist application users or tokens directly
+- owns low-level discovery and verification helpers, while provider-to-local-user mapping remains in `service`
 
 Current state:
 
-- `main` constructs the client and injects it into `service.Service.Auth0`
-- REST handlers under `/api/v3/auth0/*` call service methods, not the client directly
+- `main` constructs the client and injects it into `service.Service.OIDC`
+- REST handlers under `/api/v3/oidc/*` call service methods, not the client directly
 
 ### `authn`
 
@@ -479,6 +488,29 @@ Current state:
 
 - `gitstore` depends on `tenant.FromContext(...)` for per-tenant filesystem roots and lock keys
 - `service.ContextWithTenant(...)` and `service.TenantFromContext(...)` now delegate to the shared `tenant` package for compatibility, so middleware and gitstore use one tenant-context contract
+
+### `wikiv2`
+
+Component reference: [architecture/wiki-storage-v2.md](architecture/wiki-storage-v2.md)
+
+Ownership:
+
+- git-authoritative wiki path and slug translation helpers
+- durable ref compare-and-swap primitives for wiki writes
+- derived index contracts for reconcile progress and live page projections
+- manual reconcile request and result types shared by service orchestration
+
+Rules:
+
+- `wikiv2` defines storage and reconcile primitives, not HTTP handlers or route contracts
+- it may depend on low-level git and wiki catalog validation helpers, but it must not issue GORM queries or shape transport responses
+- service owns permission checks, orchestration, and lifecycle policy around these primitives
+
+Current state:
+
+- `service` uses `wikiv2` for slug/path parity, write-plan creation, and manual reconcile entrypoints
+- `db` owns the concrete `wiki_page_index`, `wiki_index_state`, `wiki_backlinks`, and optional `wiki_page_history` tables, while `wikiv2` owns the domain contracts those tables implement
+- the package is additive and does not yet replace the existing routed wiki handlers or all catalog-derived projections
 
 ### `ratelimit`
 
@@ -586,9 +618,11 @@ Current state:
 Ownership split:
 
 - `middleware`: extract API auth headers, reject malformed or missing credentials, and inject request-scoped auth context
+- `server`: optional public embedding seam that can accept a trusted host authenticator, then adapt it into the shared middleware pipeline
+- `auth`: public identity shape for embedded hosts using the server package
 - `controlplane`: in multi-tenant mode, resolve token -> `CPUser` -> tenant `*gorm.DB`, and ensure the tenant-local `db.User` exists
-- `service`: validate API tokens and resolve user-by-token in single-DB mode; persist application users and tokens for Auth0-backed human login
-- `auth0`: perform outbound device-flow requests and ID token verification
+- `service`: validate API tokens and resolve user-by-token in single-DB mode; persist application users and tokens for OIDC-backed human login; map trusted embedded identities onto internal `db.User` + `UserIdentity` rows
+- `oidc`: perform provider-neutral discovery, device-flow requests, and ID token verification
 - `githttp`: uses the same auth middleware on Git routes, with `TokenAuth` in control-plane mode and `OptionalTokenAuth` in single-DB mode
 - `rest` and `graphql`: consume `GetCurrentUser(ctx)` and assume middleware has prepared the context
 
@@ -596,7 +630,11 @@ Rule:
 
 - surface handlers must not parse auth headers themselves
 - control-plane routing and single-DB validation are both first-class current auth paths
-- outbound identity-provider clients such as `auth0` must not write application state directly
+- embedded single-DB hosts may inject a trusted identity through `server.WithAuthenticator`; middleware must still be the single place that turns that identity into request context
+- the trusted identity contract requires non-empty `Provider`, `Subject`, and `Login`; AGS owns the mapping from that tuple onto `db.User` + `db.UserIdentity`
+- when embedded identity is present in single-DB mode, it takes precedence over `Authorization` headers and must flow through every REST/GraphQL/Git route family that already depends on optional or required auth context, including `/api/v3/rate_limit` and `/api/v3/users/{username}/starred`
+- outbound identity-provider clients such as `oidc` must not write application state directly
+- control-plane mode currently stays fail-closed for embedded identities until a tenant-aware resolver contract is added
 
 ### Collaboration Authorization
 
@@ -657,6 +695,9 @@ Rule:
 - only `service` coordinates tenant-local GORM state and Git state together
 - in multi-tenant mode, request-scoped tenant DB selection must happen before service methods run, through `controlplane.DBRouter` + `service.ContextWithDB(...)`
 - database-backed metadata is allowed even for repository or pull-request domains, but it must not replace Git as the authority for Git-native behavior
+- current wiki rule: the sibling `*.wiki.git` repo is authoritative for wiki page content, path layout, commit history, and lexical search recall, while TiDB-backed wiki tables remain rebuildable derived indexes and transitional compatibility surfaces until the final `#1488` cleanup lands
+- `wikicatalog` remains in the tree only as transitional logic that still backs some routed handlers and migration paths; it must not be treated as the long-term durable authority
+- issue `#1488` tracks the remaining cleanup toward a fully git-authoritative wiki stack; see `docs/architecture/wiki-storage-v2.md` for the approved target design
 
 Current state:
 
@@ -712,7 +753,7 @@ Current state:
 | `oauth -> *service.Service` | OAuth handler | acceptable for now | small package; current direct wiring is simple |
 | `githttp -> *gitstore.Store` | Git transport | intended | transport handler needs direct repo access |
 | `githttp -> *service.Service` | ensure repo exists, post-push follow-up | acceptable but visible debt | transport + follow-up logic are coupled in one package |
-| `service -> Auth0DeviceFlow` | human-login flows | acceptable for now | keeps outbound identity-provider details behind a narrow domain seam |
+| `service -> oidc.Client` | generic human-login flows | acceptable for now | keeps provider-neutral OIDC protocol work outside business-state orchestration |
 | `gitstore -> tenant` | per-tenant repo roots and lock keys | intended | physical repo scoping is an infrastructure concern, not a service concern |
 
 ## Refactors Worth Doing

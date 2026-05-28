@@ -14,21 +14,27 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"gh-server/internal/controlplane"
-	"gh-server/internal/githttp"
-	"gh-server/internal/graphql"
-	srvmiddleware "gh-server/internal/middleware"
-	"gh-server/internal/oauth"
-	"gh-server/internal/rest"
+	"github.com/ngaut/agent-git-service/internal/controlplane"
+	"github.com/ngaut/agent-git-service/internal/githttp"
+	"github.com/ngaut/agent-git-service/internal/graphql"
+	srvmiddleware "github.com/ngaut/agent-git-service/internal/middleware"
+	"github.com/ngaut/agent-git-service/internal/oauth"
+	"github.com/ngaut/agent-git-service/internal/rest"
 )
 
 const defaultNonGitBodyLimitBytes int64 = 50 << 20
+const defaultRESTPrefix = "/api/v3"
 
 // RegisterRoutes wires all routes onto the router and returns the host-aware
 // mux that handles api.github.localhost path rewriting.
 // dbRouter is optional: when non-nil, tokens are resolved through the control
 // plane for multi-agent DB routing. When nil, current single-DB behavior is used.
-func RegisterRoutes(r chi.Router, handlers *rest.Deps, gitHandler *githttp.Handler, gqlSrv *graphql.Server, oauthHandler *oauth.Handler, dbRouter *controlplane.DBRouter, consoleBaseURL string) http.Handler {
+func RegisterRoutes(r chi.Router, handlers *rest.Deps, gitHandler *githttp.Handler, gqlSrv *graphql.Server, oauthHandler *oauth.Handler, dbRouter *controlplane.DBRouter, consoleBaseURL string, embeddedAuth ...srvmiddleware.EmbeddedAuthConfig) http.Handler {
+	var authCfg srvmiddleware.EmbeddedAuthConfig
+	if len(embeddedAuth) > 0 {
+		authCfg = embeddedAuth[0]
+	}
+
 	// Keep the default 50 MB cap for API traffic, but let git-receive-pack
 	// enforce its own GitHub-style push limit in internal/githttp.
 	r.Use(srvmiddleware.MaxBodySizeUnless(defaultNonGitBodyLimitBytes, func(r *http.Request) bool {
@@ -43,14 +49,14 @@ func RegisterRoutes(r chi.Router, handlers *rest.Deps, gitHandler *githttp.Handl
 
 	rateLimitMw := srvmiddleware.APIRateLimitHeaders()
 
-	registerOAuthRoutes(r, oauthHandler, dbRouter)
+	registerOAuthRoutes(r, oauthHandler, dbRouter, authCfg)
 	registerPublicAuthRoutes(r, handlers, rateLimitMw)
 	registerAgentPublicRoutes(r, handlers, rateLimitMw)
-	registerGitHTTPRoutes(r, gitHandler, handlers, dbRouter, consoleBaseURL)
-	registerAPIDiscoveryRoutes(r, handlers, rateLimitMw)
-	registerPublicUserLookupRoutes(r, handlers, dbRouter, rateLimitMw)
-	registerPublicRepoRoutes(r, handlers, dbRouter, rateLimitMw)
-	registerAuthenticatedRoutes(r, handlers, gqlSrv, dbRouter, rateLimitMw)
+	registerGitHTTPRoutes(r, gitHandler, handlers, dbRouter, consoleBaseURL, authCfg)
+	registerAPIDiscoveryRoutes(r, handlers, dbRouter, rateLimitMw, authCfg)
+	registerPublicUserLookupRoutes(r, handlers, dbRouter, rateLimitMw, authCfg)
+	registerPublicRepoRoutes(r, handlers, dbRouter, rateLimitMw, authCfg)
+	registerAuthenticatedRoutes(r, handlers, gqlSrv, dbRouter, rateLimitMw, authCfg)
 	registerNotFoundHandler(r)
 
 	return registerHostMux(r)
@@ -140,14 +146,14 @@ func buildOrigin(scheme, host, port string) string {
 	return scheme + "://" + host
 }
 
-func registerOAuthRoutes(r chi.Router, oauthHandler *oauth.Handler, dbRouter *controlplane.DBRouter) {
+func registerOAuthRoutes(r chi.Router, oauthHandler *oauth.Handler, dbRouter *controlplane.DBRouter, embeddedAuth srvmiddleware.EmbeddedAuthConfig) {
 	// Public OAuth endpoints used by the device and auth-code bootstrap flow.
 	r.Post("/login/device/code", oauthHandler.RequestDeviceCode)
 	r.Post("/login/oauth/access_token", oauthHandler.AccessToken)
 	r.Get("/login/oauth/authorize", oauthHandler.Authorize)
 	// Device code approval requires an authenticated user; the handler also checks
 	// context directly so direct unit tests cannot bypass the contract.
-	authMW := srvmiddleware.TokenAuth(oauthHandler.Svc, dbRouter)
+	authMW := srvmiddleware.TokenAuthWithEmbeddedIdentity(oauthHandler.Svc, dbRouter, embeddedAuth)
 	deviceVerificationRateLimit := srvmiddleware.RateLimit(5, time.Minute)
 	r.With(deviceVerificationRateLimit, authMW).Get("/login/device", oauthHandler.DeviceCodeVerification)
 	r.With(deviceVerificationRateLimit, authMW).Post("/login/device", oauthHandler.DeviceCodeVerification)
@@ -156,11 +162,12 @@ func registerOAuthRoutes(r chi.Router, oauthHandler *oauth.Handler, dbRouter *co
 func registerPublicAuthRoutes(r chi.Router, handlers *rest.Deps, rateLimitMw func(http.Handler) http.Handler) {
 	r.Group(func(r chi.Router) {
 		r.Use(rateLimitMw)
-		// Auth0 device flow (no auth required)
-		r.Post("/api/v3/auth0/device/code", handlers.Auth0DeviceCode)
-		r.Post("/api/v3/auth0/session", handlers.Auth0Session)
-		r.Post("/api/v3/auth0/callback", handlers.Auth0Callback)
-		r.Post("/api/v3/auth0/lookup", handlers.Auth0Lookup)
+		r.Post("/api/v3/oidc/device/code", handlers.OIDCDeviceCode)
+		r.Post("/api/v3/oidc/session", handlers.OIDCSession)
+		r.Post("/api/v3/oidc/callback", handlers.OIDCCallback)
+		r.Post("/api/v3/oidc/lookup", handlers.OIDCLookup)
+		r.Get("/auth/slock/login", handlers.SlockLogin)
+		r.Get("/auth/slock/callback", handlers.SlockCallback)
 	})
 }
 
@@ -172,7 +179,7 @@ func registerAgentPublicRoutes(r chi.Router, handlers *rest.Deps, rateLimitMw fu
 	})
 }
 
-func registerGitHTTPRoutes(r chi.Router, gitHandler *githttp.Handler, handlers *rest.Deps, dbRouter *controlplane.DBRouter, consoleBaseURL string) {
+func registerGitHTTPRoutes(r chi.Router, gitHandler *githttp.Handler, handlers *rest.Deps, dbRouter *controlplane.DBRouter, consoleBaseURL string, embeddedAuth srvmiddleware.EmbeddedAuthConfig) {
 	// Git Smart HTTP
 	// In control-plane mode, require auth so unauthenticated requests are blocked.
 	// In single-DB mode, preserve existing behavior and allow optional auth.
@@ -186,9 +193,9 @@ func registerGitHTTPRoutes(r chi.Router, gitHandler *githttp.Handler, handlers *
 
 		var authMw func(http.Handler) http.Handler
 		if dbRouter != nil {
-			authMw = srvmiddleware.TokenAuth(handlers.Svc, dbRouter)
+			authMw = srvmiddleware.TokenAuthWithEmbeddedIdentity(handlers.Svc, dbRouter, embeddedAuth)
 		} else {
-			authMw = srvmiddleware.OptionalTokenAuth(handlers.Svc, dbRouter)
+			authMw = srvmiddleware.OptionalTokenAuthWithEmbeddedIdentity(handlers.Svc, dbRouter, embeddedAuth)
 		}
 
 		r.With(authMw).Get("/info/refs", gitHandler.InfoRefs)
@@ -231,12 +238,12 @@ func pathParam(r *http.Request, key string) string {
 	return raw
 }
 
-func registerAPIDiscoveryRoutes(r chi.Router, handlers *rest.Deps, rateLimitMw func(http.Handler) http.Handler) {
+func registerAPIDiscoveryRoutes(r chi.Router, handlers *rest.Deps, dbRouter *controlplane.DBRouter, rateLimitMw func(http.Handler) http.Handler, embeddedAuth srvmiddleware.EmbeddedAuthConfig) {
 	// API with optional auth
 	// Allow unauthenticated access for API discovery, but return 401
 	// if an Authorization header is present with an empty/invalid token.
 	r.Group(func(r chi.Router) {
-		r.Use(srvmiddleware.OptionalTokenAuth(handlers.Svc, handlers.Router))
+		r.Use(srvmiddleware.OptionalTokenAuthWithEmbeddedIdentity(handlers.Svc, dbRouter, embeddedAuth))
 		r.Use(rateLimitMw)
 		r.Get("/api/v3", handlers.GetMeta)  // without trailing slash
 		r.Get("/api/v3/", handlers.GetMeta) // with trailing slash
@@ -253,9 +260,9 @@ func registerAPIDiscoveryRoutes(r chi.Router, handlers *rest.Deps, rateLimitMw f
 // registerPublicRepoRoutes registers repo-scoped routes under OptionalTokenAuth
 // so that public repositories are readable without authentication.
 // Write methods (POST/PUT/PATCH/DELETE) still require a valid token.
-func registerPublicRepoRoutes(r chi.Router, handlers *rest.Deps, dbRouter *controlplane.DBRouter, rateLimitMw func(http.Handler) http.Handler) {
+func registerPublicRepoRoutes(r chi.Router, handlers *rest.Deps, dbRouter *controlplane.DBRouter, rateLimitMw func(http.Handler) http.Handler, embeddedAuth srvmiddleware.EmbeddedAuthConfig) {
 	r.Group(func(r chi.Router) {
-		r.Use(srvmiddleware.OptionalTokenAuth(handlers.Svc, dbRouter))
+		r.Use(srvmiddleware.OptionalTokenAuthWithEmbeddedIdentity(handlers.Svc, dbRouter, embeddedAuth))
 		r.Use(rateLimitMw)
 		r.Use(srvmiddleware.RequireAuthForWrites(handlers.Svc))
 
@@ -264,18 +271,18 @@ func registerPublicRepoRoutes(r chi.Router, handlers *rest.Deps, dbRouter *contr
 	})
 }
 
-func registerPublicUserLookupRoutes(r chi.Router, handlers *rest.Deps, dbRouter *controlplane.DBRouter, rateLimitMw func(http.Handler) http.Handler) {
+func registerPublicUserLookupRoutes(r chi.Router, handlers *rest.Deps, dbRouter *controlplane.DBRouter, rateLimitMw func(http.Handler) http.Handler, embeddedAuth srvmiddleware.EmbeddedAuthConfig) {
 	r.Group(func(r chi.Router) {
-		r.Use(srvmiddleware.OptionalTokenAuth(handlers.Svc, dbRouter))
+		r.Use(srvmiddleware.OptionalTokenAuthWithEmbeddedIdentity(handlers.Svc, dbRouter, embeddedAuth))
 		r.Use(rateLimitMw)
 
 		r.Get("/api/v3/users/{username}/starred", handlers.ListUserStarredRepos)
 	})
 }
 
-func registerAuthenticatedRoutes(r chi.Router, handlers *rest.Deps, gqlSrv *graphql.Server, dbRouter *controlplane.DBRouter, rateLimitMw func(http.Handler) http.Handler) {
+func registerAuthenticatedRoutes(r chi.Router, handlers *rest.Deps, gqlSrv *graphql.Server, dbRouter *controlplane.DBRouter, rateLimitMw func(http.Handler) http.Handler, embeddedAuth srvmiddleware.EmbeddedAuthConfig) {
 	r.Group(func(r chi.Router) {
-		r.Use(srvmiddleware.TokenAuth(handlers.Svc, dbRouter))
+		r.Use(srvmiddleware.TokenAuthWithEmbeddedIdentity(handlers.Svc, dbRouter, embeddedAuth))
 		r.Use(rateLimitMw)
 
 		registerGraphQLRoutes(r, gqlSrv)
@@ -326,7 +333,10 @@ func registerPresenceRoutes(r chi.Router, handlers *rest.Deps) {
 func registerAgentBindingRoutes(r chi.Router, handlers *rest.Deps) {
 	r.Post("/api/v3/agent-invites", handlers.CreateAgentInvite)
 	r.Post("/api/v3/agent-bindings/confirm", handlers.ConfirmAgentBinding)
+	r.Patch("/api/v3/agent-bindings/{agent_login}", handlers.RenameBoundAgent)
 	r.Post("/api/v3/agent-bindings/{agent_login}/reset-token", handlers.ResetAgentToken)
+	r.Post("/api/v3/agent-bindings/{agent_login}/switch-session", handlers.SwitchAgentSession)
+	r.Post("/api/v3/agent-bindings/{agent_login}/refresh-session", handlers.RefreshAgentSwitchSession)
 }
 
 func registerUserScopedRoutes(r chi.Router, handlers *rest.Deps) {
@@ -457,6 +467,13 @@ func registerRepoPagesRoutes(r chi.Router, handlers *rest.Deps) {
 }
 
 func registerRepoWikiRoutes(r chi.Router, handlers *rest.Deps) {
+	r.Post("/api/v3/admin/wiki/repos/{owner}/{repo}/repair-locks", handlers.RepairWikiLocks)
+	r.Get("/api/v3/repos/{owner}/{repo}/wiki/state", handlers.GetWikiState)
+	r.Get("/api/v3/repos/{owner}/{repo}/wiki/tree", handlers.ListWikiTree)
+	r.Post("/api/v3/repos/{owner}/{repo}/wiki/reconcile/request", handlers.RequestWikiReconcile)
+	r.Post("/api/v3/repos/{owner}/{repo}/wiki/reconcile", handlers.ReconcileWiki)
+	r.Post("/api/v3/repos/{owner}/{repo}/wiki/compact", handlers.CompactWikiHistory)
+	r.Get("/api/v3/repos/{owner}/{repo}/wiki/compact/{jobID}", handlers.GetWikiCompactionJob)
 	r.Post("/api/v3/repos/{owner}/{repo}/wiki/move", handlers.MoveWikiPagePrefix)
 	r.Get("/api/v3/repos/{owner}/{repo}/wiki/pages", handlers.ListWikiPages)
 	r.Get("/api/v3/repos/{owner}/{repo}/wiki/search", handlers.SearchWikiPages)
@@ -949,9 +966,9 @@ func registerHostMux(r chi.Router) http.Handler {
 			if p == "/graphql" {
 				req.URL.Path = "/api/graphql"
 			} else if !strings.HasPrefix(p, "/api/") {
-				req.URL.Path = "/api/v3" + p
+				req.URL.Path = defaultRESTPrefix + p
 				if req.URL.RawPath != "" {
-					req.URL.RawPath = "/api/v3" + req.URL.RawPath
+					req.URL.RawPath = defaultRESTPrefix + req.URL.RawPath
 				}
 			}
 		}

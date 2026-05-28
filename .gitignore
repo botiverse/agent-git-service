@@ -1,6 +1,6 @@
 # Binaries
-gh-server
-gh-server-bin
+/gh-server
+/gh-server-bin
 /cli/gh
 
 # Runtime data
@@ -40,3 +40,4 @@ coverage.out
 
 # Frontend/tool caches
 .vite/
+visualization/.vite/

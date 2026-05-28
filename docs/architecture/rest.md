@@ -169,17 +169,22 @@ Wiki path-slug hierarchy rules:
 - page slugs are lowercase canonical paths such as `guides/setup`
 - wiki page routes treat `{slug}` as one percent-encoded path parameter; clients must request nested slugs such as `guides/setup` as `guides%2Fsetup` when the slug is followed by a subresource, for example `/wiki/pages/guides%2Fsetup/history`
 - `GET /api/v3/repos/{owner}/{repo}/wiki/pages/{slug}` accepts an optional `ref` query parameter to read the page body and blob SHA at a full commit SHA from that page's history; omitted `ref` still reads HEAD
+- `GET /api/v3/repos/{owner}/{repo}/wiki/tree` accepts `path` and optional `ref`, and returns one authoritative directory view from the wiki tree with directory/page URLs under `/wiki/...`
 - `GET /api/v3/repos/{owner}/{repo}/wiki/pages` accepts `path`, `recursive`, `label`/`labels`, and `exclude_label`/`exclude_labels` query parameters for prefix-scoped and label-scoped listing
 - `GET /api/v3/repos/{owner}/{repo}/wiki/search` accepts `q`, `limit`, `offset`, `label`/`labels`, and `exclude_label`/`exclude_labels`, returns `{results, query, method, elapsed_ms}`, and caps `limit` server-side at 50
+- `GET /api/v3/repos/{owner}/{repo}/wiki/state` exposes the current derived-index SHA, timestamps, and page count for the authoritative wiki surface
+- `POST /api/v3/repos/{owner}/{repo}/wiki/reconcile/request` persists an async reconcile request marker; `POST /api/v3/repos/{owner}/{repo}/wiki/reconcile` runs the reconcile synchronously and returns the persisted result
 - `GET/POST/PUT/DELETE /api/v3/repos/{owner}/{repo}/wiki/pages/{slug}/labels...` attaches repo-scoped labels to wiki pages; labels are metadata, not git-tracked page content
 - `POST /api/v3/repos/{owner}/{repo}/wiki/move` atomically renames every page whose slug equals `from` or starts with `from/`, requires an `if_match` SHA map that covers the full source set, and returns one commit for the entire move
+- `POST /api/v3/repos/{owner}/{repo}/wiki/compact` remains reserved for repo-admin callers, but it is temporarily disabled while the wiki catalog corruption incident is contained and repaired
 - `POST /api/v3/repos/{owner}/{repo}/wiki/pages/{slug}/move` performs an atomic rename with `new_slug` and `if_match`, rewrites eligible inbound wiki references in the same commit, and returns `{ moved, rewrites, skipped }`
 - wiki page get/list/search/backlink response `title` values are deterministically derived from the page slug leaf, not from the markdown body heading; for example `guides/plain-page` returns `Plain Page`
 - wiki page get/list/search responses include `labels`, shaped with the existing repository label JSON contract
 - wiki write endpoints reject `ref` because historical revision edits are out of scope for the current REST contract
 - only the exact single-segment routes `/wiki/pages/{slug}/history`, `/wiki/pages/{slug}/backlinks`, `/wiki/pages/{slug}/move`, and `/wiki/pages/{slug}/labels...` bind the wiki subresources directly
 - read/list/backlink operations also surface legacy on-disk wiki filenames that still contain uppercase letters, underscores, or dots
-- wiki search indexing is asynchronous after successful put/move/delete/label writes, so clients must tolerate short freshness lag; when embeddings are unavailable or semantic ranking fails, the endpoint falls back to substring matching and reports `method: "substring"`
+- catalog-backed wiki read responses set `X-Wiki-Migration-In-Progress: true` while a stale repository is being replayed into the catalog in the background
+- wiki search indexing is asynchronous after successful put/move/delete/label writes, so candidate selection can lag briefly; before paginating the response, stale missing pages are filtered out and surviving results are refreshed through the current catalog-backed live page read path so titles/snippets/labels reflect the latest page view, and when embeddings are unavailable or semantic ranking fails, the endpoint falls back to substring matching and reports `method: "substring"`
 
 ### Wiki Page History
 
@@ -191,6 +196,17 @@ Wiki path-slug hierarchy rules:
 - paginate with the shared `pagination.go` helpers so `page`, `per_page`, and RFC 5988 `Link` headers match the rest of the REST surface
 - transform each entry to `{ sha, message, author, committer, date, body_size }`
 - rely on the standard service error mapping so missing wiki pages stay `404`
+
+### Wiki History Compaction
+
+`POST /api/v3/repos/{owner}/{repo}/wiki/compact` follows the standard REST pattern:
+
+- resolve `{owner}` and `{repo}` from the path
+- require `RepoPermissionAdmin`
+- reject `ref` and any non-empty `before` payload because bounded compaction is not implemented yet
+- create or resume one repo-scoped compaction job that performs a catalog-first compact and then materializes a `refs/heads/compacted-<timestamp>` git projection
+
+`GET /api/v3/repos/{owner}/{repo}/wiki/compact/{job_id}` requires `RepoPermissionAdmin` and returns the current async job state.
 
 ### Git-Backed REST Request
 

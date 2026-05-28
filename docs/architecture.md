@@ -16,8 +16,11 @@ It exposes four primary surfaces:
 - Git Smart HTTP
 - OAuth device flow
 
-It also exposes additive repo-specific endpoints such as Auth0-backed human-login
-helpers under `/api/v3/auth0/*` when Auth0 is configured.
+It also exposes additive repo-specific endpoints such as OIDC-backed human-login
+helpers under `/api/v3/oidc/*`, Login-with-Slock browser helpers under
+`/auth/slock/*`, plus admin-only wiki maintenance endpoints such as
+`/api/v3/admin/wiki/repos/{owner}/{repo}/repair-locks` for stale wiki ref-lock
+recovery.
 
 From a user-facing perspective, the main entry points are GitHub-compatible clients, including `gh` CLI, plus the REST discovery/auth endpoints `/api/v3/`, `/api/v3/meta`, and `/api/v3/rate_limit`. Git Smart HTTP is typically exercised after that setup path, when a Git client or credential helper crosses into clone, fetch, or push.
 
@@ -29,6 +32,12 @@ Authority is split by concern:
 - Git is authoritative for Git-native repository state and behavior.
 - The relational database is authoritative for higher-level metadata such as users, auth, issues, pull requests, reviews, labels, workflow records, and related product state.
 - `service` coordinates flows that need both Git-backed and DB-backed state.
+
+Current wiki contract:
+
+- The sibling bare `*.wiki.git` repository is the durable authority for wiki page content, path layout, commit history, ref-pinned reads, rename semantics, and prefix moves.
+- TiDB-backed wiki tables still serve some indexed metadata and current-page compatibility paths during the final cutover, but wiki lexical search now treats git as the primary authority and only falls back to the DB cache when git access is unavailable.
+- Remaining wiki re-architecture work is tracked in [architecture/wiki-storage-v2.md](architecture/wiki-storage-v2.md) and the cutover runbook in [operations/wiki-storage-v2-cutover.md](operations/wiki-storage-v2-cutover.md), with the remaining goal of removing the last current-page and metadata transitional paths so every derived wiki index stays obviously rebuildable from git without reintroducing catalog-first writes.
 
 This does not prohibit repository- or pull-request-related metadata in the database.
 The rule is about authority: Git-native behavior stays Git-backed, while relational metadata stays DB-backed.
@@ -43,8 +52,10 @@ The vendored `cli/` module is the gh CLI compatibility harness, not the product 
 
 | Path | Responsibility |
 |---|---|
-| `main.go` | Startup, dependency wiring, TLS setup, and listeners |
-| `internal/config` | Environment-backed configuration |
+| `auth` | Public embedding identity types for external consumers |
+| `cmd/gh-server` | CLI entrypoint, signal handling, `.env` loading, and logging init |
+| `server` | Public startup/shutdown API, embeddable constructor/handlers, dependency wiring, TLS setup, and listeners |
+| `config` | Environment-backed configuration exposed for external consumers |
 | `internal/db` | GORM models, migrations, seed data, shared state constants |
 | `internal/service` | Business logic over DB and Git storage (includes `Embedder` and `AllowAnyToken` fields) |
 | `internal/controlplane` | Shared control-plane schema and token-to-tenant DB routing |
@@ -55,7 +66,8 @@ The vendored `cli/` module is the gh CLI compatibility harness, not the product 
 | `internal/githttp` | Smart HTTP bridge to `git-http-backend` |
 | `internal/middleware` | Auth and request-size middleware |
 | `internal/oauth` | OAuth device-flow endpoints |
-| `internal/auth0` | Auth0 device-flow/JWKS client for human login |
+| `internal/oidc` | Generic OIDC discovery, device flow, and ID token verification client |
+| `internal/slockoauth` | Login-with-Slock OAuth-style client for code exchange and userinfo |
 | `internal/authn` | Shared token-resolver interfaces and auth sentinel errors |
 | `internal/embedding` | Optional embedding-backed search support |
 | `internal/crypto` | NaCl-based encryption primitives for secrets |
@@ -74,7 +86,39 @@ The vendored `cli/` module is the gh CLI compatibility harness, not the product 
 
 ## Startup and Runtime
 
-`main.go` is the composition root. The startup sequence is:
+`cmd/gh-server` is the binary entrypoint and `server` is the composition root. External embedders can either keep using `server.Run` or construct a reusable instance with `server.New(config.Config, ...)`, mount `Handler()` or the protocol-specific handler accessors, and manage listeners through `Start()` / `Shutdown(ctx)`. Embedded hosts may install `server.WithAuthenticator(...)` to inject a trusted request identity without minting AGS tokens first; AGS then owns the full identity-to-user mapping internally. The shared identity shape is exported from the top-level `auth` package. When that hook is absent, the historical token/control-plane auth flow remains unchanged.
+
+The embedded-auth contract is:
+
+- The host authenticator returns a trusted `auth.Identity` with non-empty `Provider`, `Subject`, and `Login`; `Name`, `Email`, `Groups`, and `SiteAdmin` are optional metadata that AGS will persist onto its internal user record.
+- When the authenticator returns `ok=false`, AGS falls back to its historical token flow exactly as before.
+- When the authenticator returns `ok=true`, embedded identity takes precedence over any `Authorization` header on the request. REST, GraphQL, Git Smart HTTP, OAuth device approval, discovery routes such as `/api/v3/rate_limit`, and optional-auth REST lookups such as `/api/v3/users/{username}/starred` all consume the same embedded-aware middleware path in single-DB mode.
+- Control-plane mode stays fail-closed for embedded identities until AGS grows a tenant-aware resolver contract; embedders must not expect `server.WithAuthenticator(...)` to bypass tenant routing.
+
+A minimal host implementation looks like:
+
+```go
+import (
+    "github.com/ngaut/agent-git-service/auth"
+    "github.com/ngaut/agent-git-service/server"
+)
+
+srv, err := server.New(cfg, server.WithAuthenticator(myAuthenticator{}))
+```
+
+where `myAuthenticator.Authenticate(*http.Request)` returns a stable upstream subject such as:
+
+```go
+auth.Identity{
+    Provider: "meshx",
+    Subject:  "user-123",
+    Login:    "alice",
+    Name:     "Alice",
+    Email:    "alice@example.com",
+}
+```
+
+The startup sequence is:
 
 1. Load `.env` for local development via `godotenv`.
 2. Initialize structured logging via `internal/logging`.
@@ -82,7 +126,7 @@ The vendored `cli/` module is the gh CLI compatibility harness, not the product 
 4. Initialize the main application database, run migrations, and seed default records.
 5. Initialize embeddings if `EMBEDDING_API_KEY` is present.
 6. Initialize the Git store rooted at `GIT_REPO_DIR`; when `CONTROL_PLANE_DSN` is set, enable tenant-isolated repo roots with a default-tenant fallback.
-7. Build the shared `service.Service`, wiring DB, Git store, base URL, embeddings, Auth0, and local-dev auth conveniences.
+7. Build the shared `service.Service`, wiring DB, Git store, base URL, embeddings, generic OIDC, optional Login-with-Slock, and local-dev auth conveniences.
 8. If `CONTROL_PLANE_DSN` is set, initialize the control-plane database and `controlplane.DBRouter`.
 9. Initialize REST transforms, GraphQL server, REST deps, Git HTTP handler, OAuth handler, metrics, and readiness endpoints.
 10. Register routes and start listeners.
@@ -107,11 +151,15 @@ Shutdown is graceful with a 10-second timeout.
 Route wiring lives in `internal/router/router.go`.
 That file is the executable truth for concrete endpoints.
 This document records the stable structure around those routes.
+The REST prefix is fixed at `/api/v3` to remain compatible with GitHub-compatible clients, including `gh`.
 
 ### Request Families
 
 - OAuth endpoints are unauthenticated.
-- Auth0 helper endpoints under `/api/v3/auth0/*` are unauthenticated but service-backed.
+- OIDC helper endpoints under `/api/v3/oidc/*` are unauthenticated but service-backed.
+- Login-with-Slock helper endpoints under `/auth/slock/*` are unauthenticated
+  but service-backed; they implement an external login flow that mints a local
+  AGS token after Slock userinfo validation.
 - Git Smart HTTP endpoints are routed separately from the REST/GraphQL API tree, but they still use the same auth middleware (`TokenAuth` in control-plane mode, `OptionalTokenAuth` in single-DB mode).
 - Discovery endpoints under `/api/v3`, `/api/v3/meta`, and `/api/v3/rate_limit` use optional auth and are the main user-visible discovery/auth bootstrap routes for GitHub-compatible clients, including `gh`.
 - The authenticated API contains REST and GraphQL endpoints, including the current organization-governance surfaces for explicit org creation, org invitations, teams, and outside-collaborator inspection.
@@ -291,18 +339,38 @@ not treated as the authorization decision.
 
 This is the current local/offline behavior, not the planned multi-agent model. The future Git transport auth design is documented in [design/multi-agent.md](design/multi-agent.md).
 
-### Auth0 Human Login
+### OIDC and Slock Login
 
-When Auth0 is configured, REST exposes these unauthenticated helper endpoints:
+When generic OIDC is configured, REST exposes these unauthenticated helper endpoints:
 
-- `POST /api/v3/auth0/device/code`
-- `POST /api/v3/auth0/session`
-- `POST /api/v3/auth0/callback`
-- `POST /api/v3/auth0/lookup`
+- `POST /api/v3/oidc/device/code`
+- `POST /api/v3/oidc/session`
+- `POST /api/v3/oidc/callback`
+- `POST /api/v3/oidc/lookup`
 
-These endpoints stay transport-thin: `internal/auth0` owns the outbound Auth0
-protocol work, while `service` owns mapping verified Auth0 identities onto local
-application users and tokens.
+These endpoints stay transport-thin: `internal/oidc` owns discovery, optional
+device-authorization exchange, and ID token verification, while `service` owns
+mapping verified external identities onto local application users and tokens.
+
+When Login-with-Slock is configured, REST also exposes:
+
+- `GET /auth/slock/login`
+- `GET /auth/slock/callback`
+
+Slock does not expose a standard OIDC discovery document, so `internal/slockoauth`
+owns the provider-specific browser login URL, `/api/oauth/token` code exchange,
+and `/api/oauth/userinfo` lookup. `service` maps verified Slock userinfo into the
+same local identity/session path as OIDC with provider `slock` and subject
+`<server_id>:<sub>`. Slock `type=human` maps to a human user; `type=agent` maps
+to an agent user. The callback URL is derived from `BASE_URL`, so there is no
+separate `APP_ORIGIN` setting. On success, the browser callback mints a
+short-lived one-time AGS authorization code plus a PKCE verifier. AGS stores
+the verifier in an AGS-scoped `HttpOnly` cookie on `/login/oauth/access_token`
+and then redirects the browser to `CONSOLE_BASE_URL` with the code plus
+non-secret identity metadata in the query string. The console completes sign-in
+by exchanging the code through the existing `/login/oauth/access_token` path
+with browser credentials included, so a copied redirect URL is not sufficient
+to mint a durable AGS bearer token.
 
 ### OAuth Device Flow (Secured)
 
@@ -387,7 +455,7 @@ These flows should stay central in future work:
 
 - server discovery and auth bootstrap through `/api/v3/`, `/api/v3/meta`, `/api/v3/rate_limit`, token login, and `gh auth setup-git` / Git credential setup
 - explicit organization creation and governance through `/api/v3/user/orgs`, org invitations, team membership, and outside-collaborator inspection
-- Auth0-backed human login and identity lookup through `/api/v3/auth0/*`
+- OIDC-backed human login and identity lookup through `/api/v3/oidc/*`
 - control-plane token routing when multi-tenant mode is enabled
 - repository creation, fork, transfer, delete
 - repository sharing and effective permission resolution across org base permission, direct collaborators, and team grants
@@ -403,7 +471,7 @@ The canonical configuration reference is
 [`../.env.example`](../.env.example). The top section contains the required
 quick-start settings; later sections document optional runtime capabilities.
 
-Configuration is loaded from environment variables in `internal/config/config.go`
+Configuration is loaded from environment variables in `config/config.go`
 and a small number of subsystem-local environment reads for CORS, logging,
 secret encryption, Git HTTP upload limits, and embedding concurrency.
 
@@ -456,3 +524,4 @@ To inspect the current acceptance inventory instead of hard-coding counts:
 ### Design Documents
 
 - [Multi-Agent Architecture](design/multi-agent.md) — per-agent TiDB routing, stateless deployment, JuiceFS storage
+- [Wiki Storage Re-Architecture](design/wiki-storage-rearchitecture.md) — delivery plan for issue #1488

@@ -7,11 +7,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
-	"gh-server/internal/db"
+	"github.com/ngaut/agent-git-service/internal/db"
 )
 
 var testCounter atomic.Int64
@@ -95,6 +96,28 @@ func TestResolveToken_KnownToken(t *testing.T) {
 	}
 }
 
+func TestTenantDBs_ActiveUsersOnly(t *testing.T) {
+	cpDB := newTestCPDB(t)
+	var calls atomic.Int64
+	router := NewDBRouter(cpDB, testOpenDB(t, &calls), true, RouterConfig{MaxAgents: 10})
+	defer router.Close()
+
+	seedAgentWithState(t, cpDB, "active-1", "tok-1", "dsn-1", AgentStateActive)
+	seedAgentWithState(t, cpDB, "pending-1", "tok-2", "dsn-2", AgentStatePending)
+	seedAgentWithState(t, cpDB, "active-2", "tok-3", "dsn-3", AgentStateActive)
+
+	dbs, err := router.TenantDBs(context.Background())
+	if err != nil {
+		t.Fatalf("TenantDBs: %v", err)
+	}
+	if len(dbs) != 2 {
+		t.Fatalf("len(TenantDBs) = %d, want 2", len(dbs))
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("openDB calls = %d, want 2", got)
+	}
+}
+
 func TestResolveToken_NilRouterReturnsError(t *testing.T) {
 	var router *DBRouter
 
@@ -143,6 +166,66 @@ func TestResolveToken_CachesConnection(t *testing.T) {
 	// openDB should have been called exactly once
 	if calls.Load() != 1 {
 		t.Errorf("expected openDB called 1 time, got %d", calls.Load())
+	}
+}
+
+func TestResolveToken_FallsBackToTenantToken(t *testing.T) {
+	cpDB := newTestCPDB(t)
+	var calls atomic.Int64
+	var tenantDB *gorm.DB
+	openDB := func(dsn string) (*gorm.DB, error) {
+		calls.Add(1)
+		if tenantDB != nil {
+			return tenantDB, nil
+		}
+		dir := t.TempDir()
+		dbPath := fmt.Sprintf("%s/tenant_fallback.db", dir)
+		var err error
+		tenantDB, err = gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+		if err != nil {
+			return nil, err
+		}
+		if err := db.Migrate(tenantDB); err != nil {
+			return nil, err
+		}
+		return tenantDB, nil
+	}
+	router := NewDBRouter(cpDB, openDB, true, RouterConfig{MaxAgents: 10})
+	defer router.Close()
+
+	cpUser := seedAgent(t, cpDB, "agent-fallback", "cp-token", "fallback-dsn")
+	tenantResolved, resolvedDB, err := router.ResolveToken(context.Background(), "cp-token")
+	if err != nil {
+		t.Fatalf("ResolveToken(cp-token): %v", err)
+	}
+	if tenantResolved.Login != cpUser.Login {
+		t.Fatalf("resolved login = %q, want %q", tenantResolved.Login, cpUser.Login)
+	}
+
+	expiresAt := time.Now().UTC().Add(15 * time.Minute)
+	tenantToken := db.Token{
+		UserID:     tenantResolved.ID,
+		Name:       "agent-switch-session",
+		Value:      "tenant-switch-token",
+		LastUsedAt: &expiresAt,
+		ExpiresAt:  &expiresAt,
+	}
+	if err := resolvedDB.Create(&tenantToken).Error; err != nil {
+		t.Fatalf("create tenant token: %v", err)
+	}
+
+	fallbackUser, fallbackDB, err := router.ResolveToken(context.Background(), "tenant-switch-token")
+	if err != nil {
+		t.Fatalf("ResolveToken(tenant-switch-token): %v", err)
+	}
+	if fallbackDB != resolvedDB {
+		t.Fatal("expected fallback resolution to reuse tenant DB")
+	}
+	if fallbackUser.ID != tenantResolved.ID {
+		t.Fatalf("fallback user id = %d, want %d", fallbackUser.ID, tenantResolved.ID)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("expected tenant DB to be opened during fallback resolution")
 	}
 }
 

@@ -2,20 +2,22 @@ package graphql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"strconv"
 	"strings"
 
-	"gh-server/internal/db"
+	"github.com/ngaut/agent-git-service/internal/db"
 )
 
 // logErr logs a non-nil error from a service call that would otherwise be swallowed.
 func logErr(ctx context.Context, op string, err error) {
-	if err != nil {
-		slog.ErrorContext(ctx, op, "error", err)
+	if err == nil || errors.Is(err, context.Canceled) {
+		return
 	}
+	slog.ErrorContext(ctx, op, "error", err)
 }
 
 // sshHost returns the hostname from BaseURL for ssh URL generation.

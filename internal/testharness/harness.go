@@ -18,23 +18,15 @@ import (
 	"github.com/go-chi/chi/v5"
 	"gorm.io/gorm"
 
-	"gh-server/internal/db"
-	"gh-server/internal/githttp"
-	"gh-server/internal/graphql"
-	"gh-server/internal/oauth"
-	"gh-server/internal/rest"
-	"gh-server/internal/rest/transform"
-	"gh-server/internal/router"
-	"gh-server/internal/service"
+	"github.com/ngaut/agent-git-service/internal/db"
+	"github.com/ngaut/agent-git-service/internal/githttp"
+	"github.com/ngaut/agent-git-service/internal/graphql"
+	"github.com/ngaut/agent-git-service/internal/oauth"
+	"github.com/ngaut/agent-git-service/internal/rest"
+	"github.com/ngaut/agent-git-service/internal/rest/transform"
+	"github.com/ngaut/agent-git-service/internal/router"
+	"github.com/ngaut/agent-git-service/internal/service"
 )
-
-// transformMu serializes access to the global transform.Init state during
-// HTTP request handling. Each request acquires the lock, sets transform.Init
-// to the owning harness's base URL, serves the request, restores the
-// previous value, and releases the lock. This per-request scope prevents
-// deadlocks that the previous test-lifetime scope caused when New() was
-// called more than once within one test lifecycle.
-var transformMu sync.Mutex
 
 // Harness holds the fully-wired test infrastructure.
 type Harness struct {
@@ -95,20 +87,13 @@ func New(tb testing.TB) *Harness {
 	return h
 }
 
-// wrapTransform wraps an http.Handler with middleware that sets the global
-// transform.baseURL to this harness's base URL for the duration of each
-// request. The mutex is held only during request handling — not for the test
-// lifetime — so multiple New() calls within one test cannot deadlock.
+// wrapTransform wraps an http.Handler with middleware that scopes transform URL
+// state to this harness's base URL for the duration of each request.
 func (h *Harness) wrapTransform(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		transformMu.Lock()
-		prev := transform.Base()
-		transform.Init(h.transformBase.Load().(string))
-		defer func() {
-			transform.Init(prev)
-			transformMu.Unlock()
-		}()
-		next.ServeHTTP(w, r)
+		transform.Wrap(h.transformBase.Load().(string), func() {
+			next.ServeHTTP(w, r)
+		})
 	})
 }
 

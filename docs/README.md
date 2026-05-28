@@ -30,6 +30,7 @@ Component and cross-cutting references live in [architecture/](architecture/):
 - [Collaboration Framework](architecture/collaboration-framework.md)
 - [Error Semantics](architecture/error-semantics.md)
 - [Secrets Encryption](architecture/secrets-encryption.md)
+- [Wiki Storage V2](architecture/wiki-storage-v2.md)
 
 ## Design Records
 
@@ -39,11 +40,13 @@ accepted direction, or incremental work that has not fully landed yet.
 - [Agent Auth and Account Model](design/agent-auth.md)
 - [Authorization Layer](design/authz-layer.md)
 - [Multi-Agent Architecture](design/multi-agent.md)
+- [Wiki Storage Re-Architecture](design/wiki-storage-rearchitecture.md)
 
 ## Testing And Operations
 
 - [Production Deployment](production-deployment.md)
 - [CI](ci.md)
+- [Wiki Storage V2 Cutover Checklist](operations/wiki-storage-v2-cutover.md)
 - [Token Lifecycle Test Coverage](testing/token-lifecycle.md)
 - [Dependency Licensing](governance/dependency-licensing.md)
 - [Monitoring Assets](monitoring/README.md)

@@ -2,11 +2,12 @@ package transform_test
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
-	"gh-server/internal/db"
-	"gh-server/internal/rest/transform"
+	"github.com/ngaut/agent-git-service/internal/db"
+	"github.com/ngaut/agent-git-service/internal/rest/transform"
 )
 
 const testBase = "http://test.local"
@@ -106,6 +107,48 @@ func TestRepo(t *testing.T) {
 	}
 	if owner["login"] != "alice" {
 		t.Errorf("expected owner login=alice, got %v", owner["login"])
+	}
+}
+
+func TestWrap_IsolatesConcurrentState(t *testing.T) {
+	t.Cleanup(func() { transform.Init(testBase) })
+
+	type result struct {
+		base string
+		api  string
+	}
+
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(2)
+
+	run := func(base string) {
+		transform.Wrap(base, func() {
+			ready.Done()
+			<-start
+			results <- result{
+				base: transform.Base(),
+				api:  transform.APIBase(),
+			}
+		})
+	}
+
+	go run("http://one.local")
+	go run("http://two.local")
+
+	ready.Wait()
+	close(start)
+
+	got := []result{<-results, <-results}
+	want := map[string]string{
+		"http://one.local": "http://one.local/api/v3",
+		"http://two.local": "http://two.local/api/v3",
+	}
+	for _, item := range got {
+		if item.api != want[item.base] {
+			t.Fatalf("state leaked across concurrent Wrap calls: base=%q api=%q want=%q", item.base, item.api, want[item.base])
+		}
 	}
 }
 

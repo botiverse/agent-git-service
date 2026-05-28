@@ -82,33 +82,60 @@ func buildRESTOpenAPIPaths() map[string]any {
 			}, nil), nil, response(201, "Agent created")),
 		},
 		"/api/v3/agent-invites": map[string]any{
-			"post": operation("createAgentInvite", "Create an invite token used to bind an agent to a user.", auth(), nil, nil, response(201, "Agent invite created")),
+			"post": operation("createAgentInvite", "Create an invite token used to bind an agent to a user.", auth(), jsonBody(false, map[string]any{
+				"repo_grants": map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{"repo_full_name": stringSchema("Repository full name to grant during bind."), "permission": stringSchema("Requested permission (read/write/admin).")}}},
+				"team_grants": map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{"org": stringSchema("Organization login for a team grant."), "team_slug": stringSchema("Team slug to grant during bind."), "role": stringSchema("Team role (member/maintainer).")}}},
+			}, nil), nil, response(201, "Agent invite created")),
 		},
 		"/api/v3/agent-bindings/confirm": map[string]any{
 			"post": operation("confirmAgentBinding", "Confirm an agent binding using an invite token.", auth(), jsonBody(true, map[string]any{
 				"invite_token": stringSchema("Invite token issued by POST /api/v3/agent-invites."),
 			}, []string{"invite_token"}), nil, response(200, "Binding confirmed")),
 		},
+		"/api/v3/agent-bindings/{agent_login}": map[string]any{
+			"patch": operation("renameBoundAgent", "Rename a bound agent's display name.", auth(), jsonBody(true, map[string]any{
+				"name": stringSchema("New display name for the bound agent."),
+			}, []string{"name"}), pathParams(param("agent_login", "string")), response(200, "Agent renamed")),
+		},
 		"/api/v3/agent-bindings/{agent_login}/reset-token": map[string]any{
 			"post": operation("resetAgentToken", "Rotate the token for a bound agent login.", auth(), nil, pathParams(param("agent_login", "string")), response(200, "Token rotated")),
 		},
-		"/api/v3/auth0/device/code": map[string]any{
-			"post": operation("createAuth0DeviceCode", "Start an Auth0 device-code login flow.", nil, nil, nil, response(200, "Device code issued")),
+		"/api/v3/agent-bindings/{agent_login}/switch-session": map[string]any{
+			"post": operation("switchAgentSession", "Create a temporary console session for a bound agent without rotating its existing tokens.", auth(), nil, pathParams(param("agent_login", "string")), response(200, "Switch session created")),
 		},
-		"/api/v3/auth0/session": map[string]any{
-			"post": operation("exchangeAuth0Session", "Exchange Auth0 session data for a local session.", nil, jsonBody(true, map[string]any{
-				"device_code": stringSchema("Auth0 device code previously issued to the client."),
+		"/api/v3/agent-bindings/{agent_login}/refresh-session": map[string]any{
+			"post": operation("refreshAgentSwitchSession", "Refresh an active bound-agent switch session before it expires.", auth(), nil, pathParams(param("agent_login", "string")), response(200, "Switch session refreshed")),
+		},
+		"/api/v3/oidc/device/code": map[string]any{
+			"post": operation("createOIDCDeviceCode", "Start a generic OIDC device-code login flow.", nil, nil, nil, response(200, "Device code issued")),
+		},
+		"/api/v3/oidc/session": map[string]any{
+			"post": operation("exchangeOIDCSession", "Exchange generic OIDC session data for a local session.", nil, jsonBody(true, map[string]any{
+				"device_code": stringSchema("OIDC device code previously issued to the client."),
 			}, []string{"device_code"}), nil, response(200, "Session established")),
 		},
-		"/api/v3/auth0/callback": map[string]any{
-			"post": operation("handleAuth0Callback", "Handle the Auth0 callback payload.", nil, jsonBody(true, map[string]any{
-				"id_token": stringSchema("Auth0 ID token returned from the login redirect flow."),
+		"/api/v3/oidc/callback": map[string]any{
+			"post": operation("handleOIDCCallback", "Handle the generic OIDC callback payload.", nil, jsonBody(true, map[string]any{
+				"id_token": stringSchema("OIDC ID token returned from the login redirect flow."),
 			}, []string{"id_token"}), nil, response(200, "Callback processed")),
 		},
-		"/api/v3/auth0/lookup": map[string]any{
-			"post": operation("lookupAuth0Identity", "Resolve an Auth0 identity to a local user.", nil, jsonBody(true, map[string]any{
-				"id_token": stringSchema("Auth0 ID token to validate and map to a local user."),
+		"/api/v3/oidc/lookup": map[string]any{
+			"post": operation("lookupOIDCIdentity", "Resolve a generic OIDC identity to a local user.", nil, jsonBody(true, map[string]any{
+				"id_token": stringSchema("OIDC ID token to validate and map to a local user."),
 			}, []string{"id_token"}), nil, response(200, "Identity resolved")),
+		},
+		"/auth/slock/login": map[string]any{
+			"get": operation("startSlockLogin", "Redirect the browser to Login-with-Slock.", nil, nil, nil, response(302, "Redirect to Slock login")),
+		},
+		"/auth/slock/callback": map[string]any{
+			"get": operation("handleSlockCallback", "Exchange a Login-with-Slock authorization code for a local session.", nil, nil, queryParams(
+				param("code", "string"),
+				param("error", "string"),
+				param("state", "string"),
+			), map[string]any{
+				"200": map[string]any{"description": "Direct agent callback without browser state returns durable token JSON; browser callback without console redirect returns a one-time AGS authorization code JSON."},
+				"302": map[string]any{"description": "Browser callback redirects to the console with a one-time AGS authorization code and PKCE verifier cookie."},
+			}),
 		},
 		"/api/v3/presence/heartbeat": map[string]any{
 			"post": operation("postPresenceHeartbeat", "Publish a presence heartbeat for the authenticated user.", auth(), jsonBody(true, map[string]any{
@@ -198,6 +225,33 @@ func buildRESTOpenAPIPaths() map[string]any {
 				param("exclude_label", "string"),
 				param("exclude_labels", "string"),
 			)...), response(200, "Wiki search results returned")),
+		},
+		"/api/v3/repos/{owner}/{repo}/wiki/tree": map[string]any{
+			"get": operation("listWikiTree", "List one directory view from the authoritative wiki tree.", nil, nil, append(pathParams(
+				param("owner", "string"),
+				param("repo", "string"),
+			), queryParams(
+				param("path", "string"),
+				param("ref", "string"),
+			)...), response(200, "Wiki tree returned")),
+		},
+		"/api/v3/repos/{owner}/{repo}/wiki/state": map[string]any{
+			"get": operation("getWikiState", "Get the authoritative wiki derived-index state for a repository.", auth(), nil, pathParams(
+				param("owner", "string"),
+				param("repo", "string"),
+			), response(200, "Current wiki state")),
+		},
+		"/api/v3/repos/{owner}/{repo}/wiki/reconcile/request": map[string]any{
+			"post": operation("requestWikiReconcile", "Request a wiki reconcile without running it synchronously.", auth(), nil, pathParams(
+				param("owner", "string"),
+				param("repo", "string"),
+			), response(202, "Reconcile request recorded")),
+		},
+		"/api/v3/repos/{owner}/{repo}/wiki/reconcile": map[string]any{
+			"post": operation("reconcileWiki", "Run the authoritative wiki reconcile synchronously and return the persisted result.", auth(), nil, pathParams(
+				param("owner", "string"),
+				param("repo", "string"),
+			), response(200, "Reconcile completed")),
 		},
 		"/api/v3/repos/{owner}/{repo}/wiki/move": map[string]any{
 			"post": operation("moveWikiPagePrefix", "Atomically move all wiki pages under one slug prefix to another prefix.", auth(), jsonBody(true, map[string]any{
@@ -294,6 +348,32 @@ func buildRESTOpenAPIPaths() map[string]any {
 				param("page", "integer"),
 				param("per_page", "integer"),
 			)...), response(200, "Wiki page history returned")),
+		},
+		"/api/v3/repos/{owner}/{repo}/wiki/compact": map[string]any{
+			"post": operation("compactWikiHistory", "Temporarily disabled while the wiki catalog corruption incident is being contained and repaired.", auth(), jsonBody(false, map[string]any{
+				"before": stringSchema("Reserved for future bounded compaction support. Currently rejected when non-empty."),
+			}, nil), pathParams(
+				param("owner", "string"),
+				param("repo", "string"),
+			), response(409, "Wiki history compaction is temporarily disabled")),
+		},
+		"/api/v3/repos/{owner}/{repo}/wiki/compact/{jobID}": map[string]any{
+			"get": operation("getWikiCompactionJob", "Get the current status for an async wiki history compaction job.", auth(), nil, pathParams(
+				param("owner", "string"),
+				param("repo", "string"),
+				param("jobID", "string"),
+			), response(200, "Wiki history compaction job returned")),
+		},
+		"/api/v3/admin/wiki/repos/{owner}/{repo}/repair-locks": map[string]any{
+			"post": operation("repairWikiLocks", "Inspect and clear stale wiki branch lock files for one repository.", auth(), jsonBody(false, map[string]any{
+				"force": map[string]any{
+					"type":        "boolean",
+					"description": "When true, clear the lock even if it is still fresh.",
+				},
+			}, nil), pathParams(
+				param("owner", "string"),
+				param("repo", "string"),
+			), response(200, "Wiki lock repair result returned")),
 		},
 		"/api/v3/repos/{owner}/{repo}/wiki/pages/{slug}/backlinks": map[string]any{
 			"get": operation("listWikiBacklinks", "List inbound wiki links for a page slug.", nil, nil, pathParams(

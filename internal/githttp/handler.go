@@ -24,10 +24,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"gh-server/internal/gitstore"
-	applog "gh-server/internal/logging"
-	"gh-server/internal/rest/respond"
-	"gh-server/internal/service"
+	"github.com/ngaut/agent-git-service/internal/gitstore"
+	applog "github.com/ngaut/agent-git-service/internal/logging"
+	"github.com/ngaut/agent-git-service/internal/rest/respond"
+	"github.com/ngaut/agent-git-service/internal/service"
 )
 
 // defaultMaxPushBytes caps a single chunked git push when no explicit override
@@ -263,7 +263,25 @@ func (h *Handler) ReceivePack(w http.ResponseWriter, r *http.Request) {
 		if err := h.Svc.SyncWorkflowsFromRepo(ctx, repoCtx.repoFullName); err != nil {
 			slog.ErrorContext(ctx, "post-push workflow sync failed", "error", err)
 		}
+		// Wiki repo pushes bypass the REST write path, so the new commits are
+		// unknown to the catalog until we replay them. Schedule that replay in
+		// the background so receive-pack is not coupled to the full backfill.
+		if parent, ok := wikiRepoParentName(repoCtx.repoFullName); ok {
+			h.Svc.KickBackgroundWikiMigration(bgCtx, parent)
+		}
 	}()
+}
+
+// wikiRepoParentName reports whether full names a wiki repo
+// (suffix ".wiki") and returns the parent repository's full name when
+// it does. Used by the post-receive hook to drive MigrateWiki for
+// wiki pushes.
+func wikiRepoParentName(full string) (string, bool) {
+	const suffix = ".wiki"
+	if !strings.HasSuffix(full, suffix) {
+		return "", false
+	}
+	return strings.TrimSuffix(full, suffix), true
 }
 
 func rejectOversizedReceivePack(w http.ResponseWriter, r *http.Request) bool {

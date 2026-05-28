@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"gh-server/internal/db"
+	"github.com/ngaut/agent-git-service/internal/db"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -190,6 +190,16 @@ func (s *Service) ListCollaborators(ctx context.Context, repoID uint) ([]db.Coll
 		Preload("User").
 		Find(&collabs).Error
 	return collabs, err
+}
+
+// ListCollaboratorUserIDs lists only collaborator user IDs for lightweight
+// membership checks that do not need full user objects.
+func (s *Service) ListCollaboratorUserIDs(ctx context.Context, repoID uint) ([]uint, error) {
+	var ids []uint
+	err := s.DBForCtx(ctx).Model(&db.Collaborator{}).
+		Where("repository_id = ?", repoID).
+		Pluck("user_id", &ids).Error
+	return ids, err
 }
 
 // IsCollaborator checks if a user is a collaborator on a repository.
